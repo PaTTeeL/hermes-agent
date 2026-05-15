@@ -6495,6 +6495,34 @@ def _has_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
         return False
 
 
+def _git_fetch_remote(git_cmd: list[str], remote: str, cwd: Path) -> bool:
+    """Try to fetch a remote. Returns True on success, False on failure."""
+    try:
+        subprocess.run(
+            git_cmd + ["fetch", remote, "--quiet"],
+            cwd=cwd,
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def _git_pull_remote(git_cmd: list[str], remote: str, branch: str, cwd: Path) -> bool:
+    """Try to pull from a remote/branch. Returns True on success, False on failure."""
+    try:
+        subprocess.run(
+            git_cmd + ["pull", "--ff-only", remote, branch],
+            cwd=cwd,
+            capture_output=True,
+            check=True,
+        )
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
 def _add_upstream_remote(git_cmd: list[str], cwd: Path) -> bool:
     """Add the official repo as the 'upstream' remote. Returns True on success."""
     try:
@@ -6564,9 +6592,9 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
 
     This implements the fork upstream sync logic:
     - If upstream remote doesn't exist, ask user if they want to add it
-    - Compare origin/main with upstream/main
-    - If origin/main is strictly behind upstream/main, pull from upstream
-    - Try to sync fork back to origin if possible
+    - Try upstream first; fall back to origin if upstream fetch fails
+    - Pull from whichever remote succeeded
+    - Sync fork back to origin if possible
     """
     has_upstream = _has_upstream_remote(git_cmd, cwd)
 
@@ -6605,25 +6633,30 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             _mark_skip_upstream_prompt()
             return
 
-    # Fetch upstream
+    # Try upstream first; fall back to origin if upstream fetch fails
+    fetch_remote = "upstream"
     print()
     print("→ Fetching upstream...")
-    try:
-        subprocess.run(
-            git_cmd + ["fetch", "upstream", "--quiet"],
-            cwd=cwd,
-            capture_output=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print("  ✗ Failed to fetch upstream. Skipping upstream sync.")
-        return
+    if not _git_fetch_remote(git_cmd, "upstream", cwd):
+        print("  ✗ Failed to fetch upstream. Falling back to origin...")
+        print("→ Fetching origin...")
+        if not _git_fetch_remote(git_cmd, "origin", cwd):
+            print("  ✗ Failed to fetch origin. Skipping sync.")
+            return
+        fetch_remote = "origin"
 
-    # Compare origin/main with upstream/main
-    origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
-    upstream_ahead = _count_commits_between(
-        git_cmd, cwd, "origin/main", "upstream/main"
-    )
+    # Compare origin/main with upstream/main (or origin/main vs origin/main if fallback)
+    if fetch_remote == "upstream":
+        origin_ahead = _count_commits_between(git_cmd, cwd, "upstream/main", "origin/main")
+        upstream_ahead = _count_commits_between(
+            git_cmd, cwd, "origin/main", "upstream/main"
+        )
+    else:
+        # Fallback to origin: compare local HEAD vs origin/main
+        origin_ahead = _count_commits_between(git_cmd, cwd, "origin/main", "HEAD")
+        upstream_ahead = _count_commits_between(
+            git_cmd, cwd, "HEAD", "origin/main"
+        )
 
     if origin_ahead < 0 or upstream_ahead < 0:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
@@ -6632,10 +6665,10 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     # If origin/main has commits not on upstream, don't trample
     if origin_ahead > 0:
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
+        print(f"ℹ Your fork has {origin_ahead} commit(s) not on {fetch_remote}.")
         print("  Skipping upstream sync to preserve your changes.")
         print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        print(f"    git pull {fetch_remote} main")
         return
 
     # If upstream is not ahead, fork is up to date
@@ -6646,31 +6679,24 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
     # origin/main is strictly behind upstream/main (can fast-forward)
     print()
     print(f"→ Fork is {upstream_ahead} commit(s) behind upstream")
-    print("→ Pulling from upstream...")
+    print(f"→ Pulling from {fetch_remote}...")
 
-    try:
-        subprocess.run(
-            git_cmd + ["pull", "--ff-only", "upstream", "main"],
-            cwd=cwd,
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        print(
-            "  ✗ Failed to pull from upstream. You may need to resolve conflicts manually."
-        )
+    if not _git_pull_remote(git_cmd, fetch_remote, "main", cwd):
+        print(f"  ✗ Failed to pull from {fetch_remote}. You may need to resolve conflicts manually.")
         return
 
-    print("  ✓ Updated from upstream")
+    print(f"  ✓ Updated from {fetch_remote}")
 
     # Try to sync fork back to origin
-    print("→ Syncing fork...")
-    if _sync_fork_with_upstream(git_cmd, cwd):
-        print("  ✓ Fork synced with upstream")
-    else:
-        print(
-            "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
-        )
-        print("    Your local repo is updated, but your fork on GitHub may be behind.")
+    if fetch_remote == "upstream":
+        print("→ Syncing fork...")
+        if _sync_fork_with_upstream(git_cmd, cwd):
+            print("  ✓ Fork synced with upstream")
+        else:
+            print(
+                "  ℹ Got updates from upstream but couldn't push to fork (no write access?)"
+            )
+            print("    Your local repo is updated, but your fork on GitHub may be behind.")
 
 
 def _invalidate_update_cache():
