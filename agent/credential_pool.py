@@ -219,6 +219,33 @@ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     return str(auth_type or AUTH_TYPE_API_KEY)
 
 
+# ── Fallback strategy constants ──────────────────────────────────────
+
+FALLBACK_STRATEGY_STRICT_SEQUENTIAL = "strict_sequential"
+FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST = "primary_else_fastest"
+FALLBACK_STRATEGY_FASTEST_RECOVERY = "fastest_recovery"
+
+SUPPORTED_FALLBACK_STRATEGIES = frozenset({
+    FALLBACK_STRATEGY_STRICT_SEQUENTIAL,
+    FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST,
+    FALLBACK_STRATEGY_FASTEST_RECOVERY,
+})
+
+
+def get_fallback_strategy() -> str:
+    """Read ``credential_pool_strategies.fallback_strategy`` from config.
+
+    Returns the strategy string (one of the FALLBACK_STRATEGY_* constants).
+    Defaults to ``strict_sequential`` if unset or unrecognised.
+    """
+    config = _load_config_safe()
+    strategies = (config or {}).get("credential_pool_strategies", {})
+    val = (strategies.get("fallback_strategy") or "").strip().lower()
+    if val in SUPPORTED_FALLBACK_STRATEGIES:
+        return val
+    return FALLBACK_STRATEGY_STRICT_SEQUENTIAL
+
+
 @dataclass
 class PooledCredential:
     provider: str
@@ -250,6 +277,8 @@ class PooledCredential:
     # usable for its sibling models.  Keep that observation separate from the
     # credential-wide status used for auth and billing failures.
     model_cooldowns: Optional[Dict[str, float]] = None
+    # Per-model 429 rate-limit tracking (429 only). Keys: model_id -> RateLimitEntry.
+    rate_limited: Dict[str, RateLimitEntry] = field(default_factory=dict)
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -277,6 +306,52 @@ class PooledCredential:
         data["extra"] = {
             k: v for k, v in payload.items() if k not in field_names and k != "provider" and v is not None
         }
+        # ``rate_limited`` rides through JSON as {model: {reset_at, consecutive_count}}; rebuild the
+        # NamedTuple values and drop malformed or stale rows (a reset_at more than the TTL cap in the
+        # past is pre-wall-clock residue from an older build).
+        if "rate_limited" in data:
+            raw_rl = data["rate_limited"]
+            if not isinstance(raw_rl, dict):
+                logger.warning(
+                    "from_dict: rate_limited is %s (expected dict), clearing for provider=%s",
+                    type(raw_rl).__name__, provider,
+                )
+                data["rate_limited"] = {}
+            else:
+                clean: Dict[str, RateLimitEntry] = {}
+                for k, v in raw_rl.items():
+                    if isinstance(v, RateLimitEntry):
+                        clean[k] = v
+                        continue
+                    if not isinstance(v, dict):
+                        logger.warning(
+                            "from_dict: rate_limited[%r] is %s (expected dict or RateLimitEntry), dropping for provider=%s",
+                            k, type(v).__name__, provider,
+                        )
+                        continue
+                    try:
+                        reset_at = float(v["reset_at"])
+                        consecutive_count = int(v["consecutive_count"])
+                    except (KeyError, ValueError, TypeError) as exc:
+                        logger.warning(
+                            "from_dict: rate_limited[%r] has invalid dict %s (%s), dropping for provider=%s",
+                            k, v, exc, provider,
+                        )
+                        continue
+                    if reset_at < 0 or consecutive_count < 0:
+                        logger.warning(
+                            "from_dict: rate_limited[%r] has negative values (reset_at=%s, count=%s), dropping for provider=%s",
+                            k, reset_at, consecutive_count, provider,
+                        )
+                        continue
+                    if reset_at < time.time() - RATE_LIMIT_TTL_MAX_SECONDS:
+                        logger.warning(
+                            "from_dict: rate_limited[%r] reset_at=%s is stale (more than TTL cap behind now), dropping for provider=%s",
+                            k, reset_at, provider,
+                        )
+                        continue
+                    clean[k] = RateLimitEntry(reset_at=reset_at, consecutive_count=consecutive_count)
+                data["rate_limited"] = clean
         data.setdefault("id", uuid.uuid4().hex[:6])
         data.setdefault("label", payload.get("source", provider))
         data.setdefault("auth_type", AUTH_TYPE_API_KEY)
@@ -291,6 +366,11 @@ class PooledCredential:
             if field_def.name in {"provider", "extra"}:
                 continue
             value = getattr(self, field_def.name)
+            if field_def.name == "rate_limited":
+                value = {
+                    k: {"reset_at": v.reset_at, "consecutive_count": v.consecutive_count}
+                    for k, v in value.items()
+                }
             if value is not None or field_def.name in _CLEAR_STATUS:
                 result[field_def.name] = value
         for k, v in self.extra.items():
@@ -410,6 +490,19 @@ def _exhausted_ttl(
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     return base
+
+
+def _model_rate_limited_until(entry: PooledCredential, model_id: str) -> Optional[float]:
+    """Return the TTL end timestamp for this model, or None if not rate-limited.
+
+    Wall clock (``time.time()``) — the same domain ``RateLimitEntry.reset_at`` is
+    written in, so the value survives a restart and reads identically across processes.
+    """
+    if model_id in entry.rate_limited:
+        ts = entry.rate_limited[model_id].reset_at
+        if time.time() < ts:
+            return ts
+    return None
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -2088,6 +2181,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 continue
             if model_cooldown_until(entry, model) is not None:
                 continue
+            if model is not None:
+                rl_until = _model_rate_limited_until(entry, model)
+                if rl_until is not None:
+                    # A per-model 429 leaves the credential usable for its sibling models; only
+                    # this model's requests skip it until the window reopens.
+                    continue
+                if clear_expired and entry.rate_limited:
+                    live = {k: v for k, v in entry.rate_limited.items() if v.reset_at > now}
+                    if len(live) != len(entry.rate_limited):
+                        entry = self._adopt(entry, persist=False, rate_limited=live)
+                        cleared_any = True
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 # Codex quota windows can reopen EARLY; a throttled live probe
@@ -2260,6 +2364,63 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._current_id = None
             return None
         return next_entry
+
+    def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
+        """Return the earliest per-model rate-limit TTL across all entries.
+
+        Returns a ``time.time()`` (wall-clock) timestamp, or None when no entry is
+        rate-limited for *model_id*. Callers that need a wait duration subtract
+        ``time.time()``; the sleep helpers treat the value as wall clock.
+        """
+        now = time.time()
+        min_ttl: Optional[float] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
+        return min_ttl
+
+    def mark_rate_limited(
+        self,
+        entry: PooledCredential,
+        model_id: str,
+        status_code: int,
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> PooledCredential:
+        """Record a per-model 429 without benching the credential.
+
+        A provider may throttle one model while the same key keeps serving its
+        siblings, so the entry stays selectable for every other model. TTL escalates
+        with consecutive 429s on the same model (``credential_pool_strategies``
+        overrides ``RATE_LIMIT_TTL_*``); ``reset_at`` is wall clock so it survives a
+        restart.
+        """
+        now = time.time()
+        existing = entry.rate_limited.get(model_id)
+        if existing and existing.reset_at > now:
+            consecutive = existing.consecutive_count + 1
+        else:
+            consecutive = 1
+        config = _load_config_safe() or {}
+        strategies = config.get("credential_pool_strategies", {}) or {}
+        first_ttl = strategies.get("rate_limit_ttl_first_seconds", RATE_LIMIT_TTL_FIRST_SECONDS)
+        step_ttl = strategies.get("rate_limit_ttl_step_seconds", RATE_LIMIT_TTL_STEP_SECONDS)
+        max_ttl = strategies.get("rate_limit_ttl_max_seconds", RATE_LIMIT_TTL_MAX_SECONDS)
+        ttl = min(first_ttl + step_ttl * (consecutive - 1), max_ttl)
+        reset_at = now + ttl
+        normalized_error = _normalize_error_context(error_context)
+        updated = replace(
+            entry,
+            rate_limited={**entry.rate_limited, model_id: RateLimitEntry(reset_at, consecutive)},
+            last_error_code=status_code,
+            last_error_reason=normalized_error.get("reason"),
+            last_error_message=normalized_error.get("message"),
+            last_error_reset_at=reset_at,
+            extra=entry.extra,
+        )
+        self._replace_entry(entry, updated)
+        self._persist()
+        return updated
 
     def mark_exhausted_and_rotate(
         self,

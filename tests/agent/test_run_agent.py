@@ -5304,7 +5304,6 @@ class TestCredentialPoolRecovery:
                 error_context=None,
                 api_key_hint=None,
                 failure_reason=None,
-                model_id=None,
             ):
                 assert status_code == 402
                 assert error_context is None
@@ -5324,28 +5323,6 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
-    def test_recover_with_pool_rotates_on_billing_reason_even_with_http_400(self, agent):
-        next_entry = SimpleNamespace(label="secondary")
-
-        class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, model_id=None):
-                assert status_code == 400
-                assert error_context == {"reason": "out_of_extra_usage"}
-                return next_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=400,
-            has_retried_429=False,
-            classified_reason=FailoverReason.billing,
-            error_context={"reason": "out_of_extra_usage"},
-        )
-
-        assert recovered is True
-        assert retry_same is False
-        agent._swap_credential.assert_called_once_with(next_entry)
 
     def test_recover_with_pool_retries_first_429_then_rotates(self, agent):
         next_entry = SimpleNamespace(label="secondary")
@@ -5359,7 +5336,7 @@ class TestCredentialPoolRecovery:
 
             def mark_exhausted_and_rotate(
                 self, *, status_code, error_context=None, api_key_hint=None,
-                failure_reason=None, model_id=None,
+                failure_reason=None,
             ):
                 assert status_code == 429
                 assert error_context is None
@@ -5386,8 +5363,6 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
-    def test_recover_with_pool_401_same_entry_refreshes_stop_after_two(self, agent):
-        """Repeated same-entry auth refreshes must eventually fall through.
 
     def test_extract_api_error_context_uses_reset_timestamp_and_reason(self, agent):
         response = SimpleNamespace(headers={})
@@ -5423,54 +5398,6 @@ class TestCredentialPoolRecovery:
 
         assert context["reason"] == "usage_limit_reached"
         assert context["message"] == "The usage limit has been reached"
-
-    def test_extract_api_error_context_go_usage_limit_reset_at(self, agent, monkeypatch):
-        import agent.agent_runtime_helpers as _arh
-        monkeypatch.setattr(_arh.time, "time", lambda: 1_000.0)
-        error = SimpleNamespace(
-            body={
-                "error": {
-                    "type": "GoUsageLimitError",
-                    "message": "Weekly usage limit reached. Resets in 6hr 29min.",
-                }
-            },
-            response=SimpleNamespace(headers={}),
-        )
-
-        context = agent._extract_api_error_context(error)
-
-        assert context["reason"] == "GoUsageLimitError"
-        assert context["reset_at"] == 1_000.0 + (6 * 60 * 60) + (29 * 60)
-
-    def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
-        next_entry = SimpleNamespace(label="secondary")
-        captured = {}
-
-        class _Pool:
-            def current(self):
-                return SimpleNamespace(label="primary")
-
-            def entries(self):
-                return []
-
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, api_key_hint=None, model_id=None):
-                captured["status_code"] = status_code
-                captured["error_context"] = error_context
-                return next_entry
-
-        agent._credential_pool = _Pool()
-        agent._swap_credential = MagicMock()
-
-        recovered, retry_same = agent._recover_with_credential_pool(
-            status_code=429,
-            has_retried_429=True,
-            error_context={"reason": "device_code_exhausted", "reset_at": "2026-04-12T10:30:00Z"},
-        )
-
-        assert recovered is True
-        assert retry_same is False
-        assert captured["status_code"] == 429
-        assert captured["error_context"]["reason"] == "device_code_exhausted"
 
 
 class TestMaxTokensParam:

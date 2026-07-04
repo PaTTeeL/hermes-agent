@@ -1751,6 +1751,15 @@ def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context:
     return _genuine
 
 
+def _should_wait_out_rate_limit(agent, api_call_count: int) -> bool:
+    """Allow one 429 wait per API call.
+
+    A second rate-limit failure at the same call means the provider is still refusing after the
+    wait, so the turn keeps its terminal handling instead of sleeping again.
+    """
+    return getattr(agent, "_rate_limit_wait_call", None) != api_call_count
+
+
 def route_classified_error(
     agent: Any, api_error: Exception, classified: Any, _retry: TurnRetryState, *, error_msg: str,
     error_context: Any, recovered_with_pool: bool, base_url: Any, model: Any,
@@ -1892,6 +1901,33 @@ def route_classified_error(
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
+            # The whole chain is rate-limited: wait once for the earliest window to reopen,
+            # then retry this request instead of failing the turn.
+            if (
+                is_rate_limited
+                and not _is_upstream
+                and _should_wait_out_rate_limit(agent, api_call_count)
+            ):
+                from agent.conversation_loop import _do_chain_exhausted_sleep
+                if _do_chain_exhausted_sleep(agent):
+                    agent._rate_limit_wait_call = api_call_count
+                    retry_count = 0
+                    return _verdict("continue")
+
+    # No fallback chain configured: a rate-limited primary with nowhere to rotate waits out the
+    # window once and retries, the same self-healing rule as an exhausted chain.
+    if (
+        is_rate_limited
+        and classified.reason != FailoverReason.upstream_rate_limit
+        and not recovered_with_pool
+        and agent._fallback_index >= len(agent._fallback_chain)
+        and _should_wait_out_rate_limit(agent, api_call_count)
+    ):
+        from agent.conversation_loop import _do_chain_exhausted_sleep
+        if _do_chain_exhausted_sleep(agent):
+            agent._rate_limit_wait_call = api_call_count
+            retry_count = 0
+            return _verdict("continue")
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.

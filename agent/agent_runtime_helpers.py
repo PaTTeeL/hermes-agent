@@ -854,6 +854,15 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
             t in context_message for t in _USAGE_LIMIT_MESSAGE_TOKENS
         )
     if not has_retried_429 and not usage_limit_reached:
+        # Record the per-model 429 window even on the first attempt, so the retry
+        # loop (and the chain-exhausted sleep) knows when this model can be retried.
+        # Without it a single-credential pool skips rotation entirely and the agent
+        # falls to a fallback with no record of the primary's rate-limit window.
+        if model_id and current_entry is not None:
+            try:
+                pool.mark_rate_limited(current_entry, model_id, 429, error_context)
+            except Exception as exc:
+                _ra().logger.debug("Could not record per-model rate limit: %s", exc)
         return False, True
     return (True, False) if rotate_and_swap(429, "rate limit") else (False, True)
 

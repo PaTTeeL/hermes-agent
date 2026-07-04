@@ -72,11 +72,11 @@ class TestPerModelRateLimitTTL:
         pool.mark_rate_limited(entry, "gpt-4", 429)
 
         # model-A should be excluded
-        available_a = pool._available_entries(model_id="gpt-4", clear_expired=True)
+        available_a, _pending_a = pool._available_entries(model="gpt-4", clear_expired=True)
         assert len(available_a) == 0
 
         # model-B should still be available
-        available_b = pool._available_entries(model_id="claude-3", clear_expired=True)
+        available_b, _pending_b = pool._available_entries(model="claude-3", clear_expired=True)
         assert len(available_b) == 1
         assert available_b[0].id == entry.id
 
@@ -90,14 +90,14 @@ class TestPerModelRateLimitTTL:
         pool.mark_rate_limited(entry, "gpt-4", 429)
 
         # Confirm rate-limited
-        available = pool._available_entries(model_id="gpt-4", clear_expired=True)
+        available, _pending = pool._available_entries(model="gpt-4", clear_expired=True)
         assert len(available) == 0
 
         # Advance time past TTL (WALL_NOW + 300)
         mock_time.return_value = WALL_NOW + 301.0
 
         # Should auto-recover and prune expired entry
-        available = pool._available_entries(model_id="gpt-4", clear_expired=True)
+        available, _pending = pool._available_entries(model="gpt-4", clear_expired=True)
         assert len(available) == 1
         assert available[0].id == entry.id
         assert "gpt-4" not in available[0].rate_limited

@@ -1171,6 +1171,111 @@ def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     reconstruct_static_prefix(agent, system_message=system_message, log_label="failover redecoration")
 
 
+def _interruptible_sleep(agent, seconds: float, *, status_msg: Optional[str] = None) -> bool:
+    """Sleep in short slices so an interrupt lands promptly.
+
+    Returns True when the full span elapsed, False when the turn was interrupted.
+    A 429 window can be minutes long, and a plain ``time.sleep`` would swallow a
+    Ctrl-C / ``/stop`` for its whole duration.
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        if status_msg and remaining > 1.0:
+            try:
+                agent._emit_status(f"{status_msg} (~{remaining:.0f}s left)...")
+            except Exception:
+                pass
+        time.sleep(min(0.2, remaining))
+
+
+def _chain_rate_limit_ttls(agent) -> tuple:
+    """Return (primary_min_ttl, fallback_first_ttl, fallback_min_ttl) for the 429 wait decision.
+
+    Each value is a wall-clock reset timestamp (``time.time()`` domain, ``RateLimitEntry``)
+    for the earliest per-model rate limit on that backend's credential pool, or None when
+    that backend carries no rate-limit record (its failure had another cause). The three
+    values are what ``_do_chain_exhausted_sleep`` turns into one sleep per strategy.
+    """
+    primary_ttl: Optional[float] = None
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is not None:
+        model = getattr(agent, "model", "") or ""
+        try:
+            primary_ttl = pool.rate_limit_min_ttl(model)
+        except Exception:
+            primary_ttl = None
+    fallback_ttls: List[float] = []
+    first_ttl: Optional[float] = None
+    for fb in (getattr(agent, "_fallback_chain", None) or []):
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        if not fb_provider or not fb_model:
+            continue
+        try:
+            from agent.credential_pool import load_pool
+            fb_pool = load_pool(fb_provider)
+        except Exception:
+            continue
+        if fb_pool is None or not fb_pool.has_credentials():
+            continue
+        try:
+            ttl = fb_pool.rate_limit_min_ttl(fb_model)
+        except Exception:
+            ttl = None
+        if ttl is None:
+            continue
+        if first_ttl is None:
+            first_ttl = ttl
+        fallback_ttls.append(ttl)
+    fallback_min_ttl = min(fallback_ttls) if fallback_ttls else None
+    return primary_ttl, first_ttl, fallback_min_ttl
+
+
+def _do_chain_exhausted_sleep(agent) -> bool:
+    """Wait once for a 429 window to reopen when every backend in the chain is rate-limited.
+
+    The primary and every fallback exhausted their retries, so no request can succeed until a
+    rate-limit window lifts. Sleeping once and retrying beats failing the turn outright.
+
+    Which window to wait for follows the ``fallback_strategy`` setting
+    (``strict_sequential`` / ``primary_else_fastest`` / ``fastest_recovery``); when no backend
+    carries a rate-limit record there is no unlock event to wait for, so this returns False and
+    the caller keeps its terminal handling.
+    """
+    primary_ttl, first_ttl, fallback_min_ttl = _chain_rate_limit_ttls(agent)
+    if primary_ttl is None and first_ttl is None and fallback_min_ttl is None:
+        return False
+    try:
+        from agent.credential_pool import get_fallback_strategy
+        strategy = get_fallback_strategy()
+    except Exception:
+        strategy = "strict_sequential"
+    if strategy == "fastest_recovery":
+        candidates = [t for t in (primary_ttl, fallback_min_ttl) if t is not None]
+        sleep_until = min(candidates) if candidates else None
+    elif strategy == "primary_else_fastest":
+        sleep_until = primary_ttl if primary_ttl is not None else fallback_min_ttl
+    else:
+        sleep_until = primary_ttl if primary_ttl is not None else first_ttl
+    now = time.time()
+    if sleep_until is None or sleep_until <= now:
+        return False
+    wait = sleep_until - now
+    logger.info(
+        "All backends rate-limited — waiting %.0fs for the earliest window (strategy=%s)",
+        wait, strategy,
+    )
+    agent._buffer_diagnostic_status(
+        f"⏳ All backends rate-limited — waiting {wait:.0f}s for the earliest window..."
+    )
+    return _interruptible_sleep(agent, wait, status_msg="⏳ Waiting for rate limit")
+
+
 def _peel_moa_guidance(messages: List[Dict[str, Any]], guidance: Any) -> List[Dict[str, Any]]:
     """Remove MoA reference guidance attached by ``_attach_reference_guidance``."""
     from agent.moa_loop import peel_reference_guidance
