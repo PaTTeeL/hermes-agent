@@ -4719,17 +4719,11 @@ def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optio
 
 
 def _named_custom_api_key(custom_entry: Dict[str, Any], provider: str, custom_base: str) -> Any:
-    """Credential for a named custom provider: inline api_key → key_env → key_cmd → credential pool → placeholder.
+    """Credential for a named custom provider: credential pool → inline api_key → key_env → key_cmd → placeholder.
     Aux resolves named custom providers here, not via _resolve_named_custom_runtime, so key_cmd must be
-    honoured at the same precedence or every aux call 401s."""
-    custom_key: Any = (custom_entry.get("api_key") or "").strip()
-    custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
-    if not custom_key and custom_key_env:
-        custom_key = _scoped_key_env(custom_key_env)
-    custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
-    if custom_key_cmd:
-        from agent.command_token_source import build_command_token_provider
-        custom_key = build_command_token_provider(custom_key_cmd, custom_entry.get("name") or provider) or custom_key
+    honoured at the same precedence or every aux call 401s. The pool comes first so its per-model
+    rate-limit and exhaustion state governs every aux call, matching the main agent's selection."""
+    custom_key: Any = ""
     if not custom_key:
         with contextlib.suppress(Exception):
             from agent.credential_pool import custom_provider_pool_key_candidates
@@ -4748,6 +4742,15 @@ def _named_custom_api_key(custom_entry: Dict[str, Any], provider: str, custom_ba
                 if str(pool_api_key).strip():
                     custom_key = str(pool_api_key).strip()
                     break
+    if not custom_key:
+        custom_key = (custom_entry.get("api_key") or "").strip()
+    custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
+    if not custom_key and custom_key_env:
+        custom_key = _scoped_key_env(custom_key_env)
+    custom_key_cmd = str(custom_entry.get("key_cmd", "") or "").strip()
+    if not custom_key and custom_key_cmd:
+        from agent.command_token_source import build_command_token_provider
+        custom_key = build_command_token_provider(custom_key_cmd, custom_entry.get("name") or provider) or custom_key
     return custom_key or "no-key-required"
 
 
