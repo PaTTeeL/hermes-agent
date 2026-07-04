@@ -1125,6 +1125,47 @@ def run_conversation(
                 except Exception:
                     pass  # Never let rate guard break the agent loop
 
+            # ── Per-model 429 TTL pool guard ─────────────────────
+            # Check if all pool keys are rate-limited for the current model
+            # before sending the API request.  This prevents wasting requests
+            # on keys whose per-model TTL hasn't expired yet.
+            if agent._credential_pool is not None:
+                _pool_may_recover = _ra()._pool_may_recover_from_rate_limit(
+                    agent._credential_pool,
+                    provider=agent.provider,
+                    base_url=getattr(agent, "base_url", None),
+                    model_id=agent.model or "",
+                )
+                if not _pool_may_recover:
+                    agent._buffer_status("⏳ Rate limited — switching to fallback provider...")
+                    if agent._try_activate_fallback():
+                        active_system_prompt = _sync_failover_system_message(
+                            agent, api_messages, active_system_prompt)
+                        retry_count = 0
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
+                    # No fallback available — abort with clear message
+                    _rl_entry = agent._restore_primary_runtime()
+                    _rl_ttl_info = ""
+                    if _rl_entry[1] is not None:
+                        _rl_remaining = max(0, _rl_entry[1] - time.monotonic())
+                        _rl_ttl_info = f" TTL expires in {_rl_remaining:.0f}s."
+                    _rl_msg = (
+                        f"❌ Rate limited by provider.{_rl_ttl_info}"
+                        "  Configure fallback_providers in config.yaml"
+                        " to avoid downtime."
+                    )
+                    agent._emit_status(_rl_msg)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _rl_msg,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "rate_limited": True,
+                    }
+
             try:
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
