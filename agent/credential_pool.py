@@ -9,10 +9,10 @@ import threading
 import time
 import uuid
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
@@ -43,6 +43,13 @@ from hermes_cli.auth import (
     read_credential_pool,
     write_credential_pool,
 )
+
+
+class RateLimitEntry(NamedTuple):
+    """Per-model 429 tracking: reset_at (wall clock time.time(), persisted to auth.json so it survives restarts) and consecutive count."""
+    reset_at: float
+    consecutive_count: int
+
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +163,11 @@ FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
 # dedup in #58265.
 NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
+# Default per-model 429 rate-limit TTL escalation (seconds), overridden by credential_pool_strategies in config.yaml.
+RATE_LIMIT_TTL_FIRST_SECONDS  = 5 * 60       # first 429 → 5 min
+RATE_LIMIT_TTL_STEP_SECONDS   = 5 * 60       # each consecutive → +5 min
+RATE_LIMIT_TTL_MAX_SECONDS    = 60 * 60      # cap at 1 hour
+
 # Pool key prefix for custom OpenAI-compatible endpoints: all share
 # provider='custom' but are keyed 'custom:<normalized_name>'.
 CUSTOM_POOL_PREFIX = "custom:"
@@ -221,6 +233,8 @@ class PooledCredential:
     agent_key: Optional[str] = None
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
+    # Per-model rate limit tracking (429 only). Keys: model_id -> RateLimitEntry.
+    rate_limited: Dict[str, RateLimitEntry] = field(default_factory=dict)
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -241,6 +255,54 @@ class PooledCredential:
         if isinstance(data.get("last_status_at"), str):
             data["last_status_at"] = _parse_absolute_timestamp(data["last_status_at"])
         data["extra"] = {k: payload[k] for k in _EXTRA_KEYS if payload.get(k) is not None}
+        if "rate_limited" in data:
+            if not isinstance(data["rate_limited"], dict):
+                logger.warning(
+                    "from_dict: rate_limited is %s (expected dict), clearing for provider=%s",
+                    type(data["rate_limited"]).__name__, provider,
+                )
+                data["rate_limited"] = {}
+            else:
+                clean: Dict[str, RateLimitEntry] = {}
+                for k, v in data["rate_limited"].items():
+                    if isinstance(v, RateLimitEntry):
+                        clean[k] = v
+                    elif isinstance(v, dict):
+                        try:
+                            if "reset_at" not in v or "consecutive_count" not in v:
+                                raise KeyError("missing required key(s)")
+                            reset_at = float(v["reset_at"])
+                            consecutive_count = int(v["consecutive_count"])
+                        except (KeyError, ValueError, TypeError) as exc:
+                            logger.warning(
+                                "from_dict: rate_limited[%r] has invalid dict %s (%s), dropping for provider=%s",
+                                k, v, exc, provider,
+                            )
+                            continue
+                        if reset_at < 0 or consecutive_count < 0:
+                            logger.warning(
+                                "from_dict: rate_limited[%r] has negative values (reset_at=%s, count=%s), dropping for provider=%s",
+                                k, reset_at, consecutive_count, provider,
+                            )
+                            continue
+                        # Stale-value guard: only drop cross-clock-domain residue
+                        # (a pre-wall-clock monotonic small number).  Normal
+                        # wall-clock expiry is cleaned lazily in
+                        # _available_entries(clear_expired=True) when that model
+                        # is actually selected — don't clear every model here.
+                        if reset_at < 1_000_000_000:
+                            logger.warning(
+                                "from_dict: rate_limited[%r] reset_at=%s looks like pre-wall-clock residue, dropping for provider=%s",
+                                k, reset_at, provider,
+                            )
+                            continue
+                        clean[k] = RateLimitEntry(reset_at=reset_at, consecutive_count=consecutive_count)
+                    else:
+                        logger.warning(
+                            "from_dict: rate_limited[%r] is %s (expected dict or RateLimitEntry), dropping for provider=%s",
+                            k, type(v).__name__, provider,
+                        )
+                data["rate_limited"] = clean
         data.setdefault("id", uuid.uuid4().hex[:6])
         data.setdefault("label", payload.get("source", provider))
         data.setdefault("auth_type", AUTH_TYPE_API_KEY)
@@ -255,6 +317,8 @@ class PooledCredential:
             if field_def.name in {"provider", "extra"}:
                 continue
             value = getattr(self, field_def.name)
+            if field_def.name == "rate_limited":
+                value = {k: {"reset_at": v.reset_at, "consecutive_count": v.consecutive_count} for k, v in value.items()}
             if value is not None or field_def.name in _CLEAR_STATUS:
                 result[field_def.name] = value
         for k, v in self.extra.items():
@@ -305,6 +369,15 @@ def _next_priority(entries: List[PooledCredential]) -> int:
 def _is_manual_source(source: str) -> bool:
     normalized = (source or "").strip().lower()
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
+
+
+def _model_rate_limited_until(entry: PooledCredential, model_id: str) -> Optional[float]:
+    """Return the TTL end timestamp for this model, or None if not rate-limited. Wall clock — see RateLimitEntry."""
+    if model_id in entry.rate_limited:
+        ts = entry.rate_limited[model_id].reset_at
+        if time.time() < ts:
+            return ts
+    return None
 
 
 def _exhausted_ttl(
@@ -1750,22 +1823,22 @@ class CredentialPool:
         # credentials are actually resolved, not on enumeration/selection.
         return False
 
-    # ---- selection ---------------------------------------------------------
+# ---- selection ---------------------------------------------------------
 
-    def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
+    def select(self, model_id: str = "") -> Optional[PooledCredential]:
+        entry, pending_refresh = self._select_under_lock(model_id=model_id if model_id else None)
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Re-select now that the refreshed entries are back in the pool.
             if entry is None:
-                entry, _ = self._select_under_lock()
+                entry, _ = self._select_under_lock(model_id=model_id if model_id else None)
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
 
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_under_lock(self, model_id: Optional[str] = None) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(model_id=model_id)
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
         """Refresh deferred single-use-token entries OUTSIDE the pool lock.
@@ -1793,7 +1866,7 @@ class CredentialPool:
         return self._sync_entry_from_auth_store(entry)
 
     def _available_entries(
-        self, *, clear_expired: bool = False, refresh: bool = False,
+        self, *, clear_expired: bool = False, refresh: bool = False, model_id: Optional[str] = None,
     ) -> Tuple[List[PooledCredential], List[PooledCredential]]:
         """Return (available, pending_refresh) for entries not in cooldown.
 
@@ -1803,7 +1876,12 @@ class CredentialPool:
         xai-oauth), which are returned as *pending_refresh* so the caller
         refreshes them outside the lock instead of stalling every pool
         consumer during cross-process flock acquisition + OAuth network I/O.
+
+        *model_id* is optional; when provided, entries rate-limited for that
+        specific model are excluded from the result.  When None, per-model
+        rate limits are ignored and all non-exhausted entries are returned.
         """
+        model_id = model_id or None
         now = time.time()
         cleared_any = False
         entries_to_prune: List[str] = []
@@ -1852,6 +1930,19 @@ class CredentialPool:
                 if clear_expired:
                     entry = self._adopt(entry, persist=False, **_MARK_OK)
                     cleared_any = True
+            if model_id is not None:
+                rl_until = _model_rate_limited_until(entry, model_id)
+                if rl_until is not None:
+                    continue
+                if clear_expired and model_id in entry.rate_limited:
+                    cleared = replace(entry, rate_limited={k: v for k, v in entry.rate_limited.items() if k != model_id})
+                    self._replace_entry(entry, cleared)
+                    entry = cleared
+                    cleared_any = True
+                    logger.info(
+                        "credential pool: per-model 429 rate-limit TTL expired for %s, cleared entry %s (provider=%s)",
+                        model_id, cleared.id, self.provider,
+                    )
             if refresh and self._entry_needs_refresh(entry):
                 if self.provider in _TOKENS_SINGLETON_PROVIDERS:
                     pending_refresh.append(entry)
@@ -1882,9 +1973,9 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_unlocked(self, model_id: Optional[str] = None, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         """Select the best available entry; returns ``(entry, pending_refresh)``."""
-        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
+        available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh, model_id=model_id)
         if not available:
             self._current_id = None
             self._log_no_available_entries()
@@ -1994,6 +2085,76 @@ class CredentialPool:
             return None
         return next_entry
 
+    def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
+        """Return the earliest per-model rate-limit TTL across all entries.
+
+        Returns a ``time.time()`` (wall-clock) timestamp, or None if no entry
+        is rate-limited for *model_id*.  Wall clock — see ``RateLimitEntry``.
+        """
+        now = time.time()
+        min_ttl: Optional[float] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
+        return min_ttl
+
+    def mark_rate_limited(
+        self,
+        entry: PooledCredential,
+        model_id: str,
+        status_code: int,
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> PooledCredential:
+        """Mark per-model rate limit (429 only). Does NOT set STATUS_EXHAUSTED.
+        TTL escalates on consecutive 429s (configurable via credential_pool_strategies).
+        reset_at stored as wall clock — see RateLimitEntry."""
+        now = time.time()
+        existing = entry.rate_limited.get(model_id)
+        # Unconditional increment: every 429 advances consecutive regardless of
+        # TTL window.  Reset (back to 1) happens explicitly via clear_rate_limit()
+        # on a successful 200, not by any time-window heuristic.
+        consecutive = (existing.consecutive_count + 1) if existing else 1
+        config = _load_config_safe() or {}
+        strategies = config.get("credential_pool_strategies", {}) or {}
+        first_ttl = strategies.get("rate_limit_ttl_first_seconds", RATE_LIMIT_TTL_FIRST_SECONDS)
+        step_ttl = strategies.get("rate_limit_ttl_step_seconds", RATE_LIMIT_TTL_STEP_SECONDS)
+        max_ttl = strategies.get("rate_limit_ttl_max_seconds", RATE_LIMIT_TTL_MAX_SECONDS)
+        ttl = min(first_ttl + step_ttl * (consecutive - 1), max_ttl)
+        reset_at = now + ttl
+        normalized_error = _normalize_error_context(error_context)
+        updated = replace(
+            entry,
+            rate_limited={**entry.rate_limited, model_id: RateLimitEntry(reset_at, consecutive)},
+            last_error_code=status_code,
+            last_error_reason=normalized_error.get("reason"),
+            last_error_message=normalized_error.get("message"),
+            last_error_reset_at=reset_at,
+            extra=entry.extra,
+        )
+        self._replace_entry(entry, updated)
+        self._persist()
+        return updated
+
+    def clear_rate_limit(self, entry_id: str, model_id: str) -> None:
+        """Clear the per-model rate_limited record (consecutive → 0) on success.
+
+        A 200 means the limit has an open window, so resetting consecutive lets a
+        later 429 start counting from 1 instead of piling on more backoff.
+        no-op when there is no record (zero IO during normal chatter when
+        consecutive is already 0), and the persist lets other sessions read
+        "no record" and restart from 1.  with self._lock; _persist."""
+        with self._lock:
+            entry = next((e for e in self._entries if e.id == entry_id), None)
+            if entry is None or model_id not in entry.rate_limited:
+                return
+            updated = replace(
+                entry,
+                rate_limited={k: v for k, v in entry.rate_limited.items() if k != model_id},
+            )
+            self._replace_entry(entry, updated)
+            self._persist()
+
     def mark_exhausted_and_rotate(
         self,
         *,
@@ -2002,6 +2163,7 @@ class CredentialPool:
         api_key_hint: Optional[str] = None,
         credential_id: Optional[str] = None,
         failure_reason: Optional[str] = None,
+        model_id: str = "",
     ) -> Optional[PooledCredential]:
         with self._lock:
             identity_supplied = bool(credential_id or api_key_hint)
@@ -2015,23 +2177,29 @@ class CredentialPool:
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
-            self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
+            if status_code == 429 and model_id:
+                logger.info("credential pool: marking %s rate-limited (model=%s, status=%s), rotating", _label, model_id, status_code)
+                self.mark_rate_limited(entry, model_id, status_code, error_context)
+            else:
+                self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
             # A 402/429/401 is a key-level failure, and the same key can back
-            # several entries (an explicit entry plus a ``model_config`` row
-            # auto-seeded from ``model.api_key``). Marking only the first
-            # leaves siblings OK, ``_select_unlocked()`` keeps handing back
-            # the depleted key, and rotation never converges (~2.5 min hang).
-            # Mark every entry sharing the failed key.
-            failed_runtime_key = entry.runtime_api_key
+            # several entries. Marking only the first leaves siblings OK and
+            # rotation never converges. Mark every entry sharing the failed key.
+            failed_runtime_key = getattr(entry, "runtime_api_key", None)
             if identity_supplied and failed_runtime_key:
-                siblings = [
-                    s for s in self._entries if s.id != entry.id and s.runtime_api_key == failed_runtime_key
-                ]
-                for sibling in siblings:
-                    self._mark_exhausted(
-                        sibling, status_code, error_context, persist=False, failure_reason=failure_reason,
-                    )
-                if siblings:
+                siblings_marked = False
+                for sibling in self._entries:
+                    if sibling.id == entry.id:
+                        continue
+                    if sibling.runtime_api_key == failed_runtime_key:
+                        if status_code == 429 and model_id:
+                            self.mark_rate_limited(sibling, model_id, status_code, error_context)
+                        else:
+                            self._mark_exhausted(
+                                sibling, status_code, error_context, persist=False, failure_reason=failure_reason
+                            )
+                        siblings_marked = True
+                if siblings_marked:
                     self._persist()
             # Re-read the updated entry to log the correct terminal state.
             updated_entry = self._find(lambda e: e.id == entry.id) or entry
@@ -2041,10 +2209,13 @@ class CredentialPool:
                     "permanently failed, will NOT re-enter rotation until re-auth",
                     _label, status_code, updated_entry.last_error_reason or "unknown",
                 )
-            else:
-                logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
+            elif status_code != 429 or not model_id:
+                logger.info(
+                    "credential pool: marking %s exhausted (status=%s), rotating",
+                    _label, status_code,
+                )
             self._current_id = None
-            next_entry, _pending = self._select_unlocked(refresh=False)
+            next_entry, _pending = self._select_unlocked(model_id=model_id if status_code == 429 and model_id else None, refresh=False)
             if next_entry:
                 logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
             return next_entry
@@ -2752,6 +2923,7 @@ def load_pool(provider: str) -> CredentialPool:
         auth_mod.heal_forked_single_use_oauth_grants(provider)
     raw_entries = read_credential_pool(provider)
     disk_ids = {e.get("id") for e in raw_entries if isinstance(e, dict) and e.get("id")}
+    raw_entries = [e for e in raw_entries if isinstance(e, dict)]
     changed = any(
         isinstance(payload, dict) and sanitize_borrowed_credential_payload(payload, provider) != payload
         for payload in raw_entries

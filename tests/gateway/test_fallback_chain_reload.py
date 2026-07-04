@@ -58,7 +58,7 @@ def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
         _fallback_model=live[0],
         _fallback_index=1,
         _fallback_activated=True,
-        _rate_limited_until=time.monotonic() + 30,
+        _rate_limited_until=time.time() + 30,
     )
     GatewayRunner._apply_fallback_chain_to_agent(
         agent,

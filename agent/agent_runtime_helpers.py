@@ -711,7 +711,7 @@ def _is_entitlement_403(agent, status_code, error_context) -> bool:
     return False
 
 
-def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
+def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap, model_id):
     if _is_entitlement_403(agent, status_code, error_context):
         _ra().logger.info(
             "Credential %s — entitlement-shaped 403 from %s; "
@@ -728,7 +728,7 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
     refreshed = pool.try_refresh_matching(**refresh_kwargs)
     if refreshed is None:
         # Refresh failed; rotate (the failed entry is already marked exhausted).
-        return (True, False) if rotate_and_swap(401, "auth refresh failed") else (False, has_retried_429)
+        return (True, False) if rotate_and_swap(401, "auth refresh failed", model_id) else (False, has_retried_429)
     # try_refresh_matching() reports success even when upstream keeps rejecting; cap same-entry
     # refreshes so a single-entry pool falls through to fallback.
     refreshed_id = getattr(refreshed, "id", None)
@@ -750,7 +750,7 @@ def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_co
     return True, has_retried_429
 
 
-def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
+def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap, model_id):
     # Already-exhausted credential: rotate immediately. Avoids the "cancel-between-429s" trap where
     # the local has_retried_429 resets per prompt and retries forever.
     current_entry = None
@@ -768,7 +768,7 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
             "Credential already exhausted (last_status=%s) — rotating immediately instead of retrying",
             current_last_status,
         )
-        return (True, False) if rotate_and_swap(429, "rate limit, pre-exhausted") else (False, True)
+        return (True, False) if rotate_and_swap(429, "rate limit, pre-exhausted", model_id) else (False, True)
     usage_limit_reached = False
     if error_context:
         context_reason = str(error_context.get("reason") or "").lower()
@@ -777,14 +777,22 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
             t in context_message for t in _USAGE_LIMIT_MESSAGE_TOKENS
         )
     if not has_retried_429 and not usage_limit_reached:
+        # Record the per-model rate-limit TTL on the first 429 so restore/sleep
+        # know when the primary model can be retried.
+        if model_id:
+            _entry = pool.current()
+            if _entry:
+                pool.mark_rate_limited(_entry, model_id, 429, error_context)
         return False, True
-    return (True, False) if rotate_and_swap(429, "rate limit") else (False, True)
+    return (True, False) if rotate_and_swap(429, "rate limit", model_id) else (False, True)
 
 
 def recover_with_credential_pool(
     agent, *, status_code: Optional[int], has_retried_429: bool,
     classified_reason: Optional[FailoverReason] = None,
-    error_context: Optional[Dict[str, Any]] = None, billing_unverified: bool = False,
+    error_context: Optional[Dict[str, Any]] = None,
+    billing_unverified: bool = False,
+    model_id: str = "",
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation; returns (recovered, has_retried_429).
     Rate limits: retry once, then rotate. Billing: rotate immediately. Auth: refresh before
@@ -818,7 +826,7 @@ def recover_with_credential_pool(
     if effective_reason is None:
         effective_reason = _STATUS_TO_FAILOVER_REASON.get(status_code)
 
-    def _rotate_and_swap(default_status: int, label: str) -> bool:
+    def _rotate_and_swap(default_status: int, label: str, model_id: str = "") -> bool:
         """Rotate away from the failed credential; True when a new entry was swapped in."""
         rotate_status = status_code if status_code is not None else default_status
         kwargs = {
@@ -837,6 +845,8 @@ def recover_with_credential_pool(
                 from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
                 failure_reason = FAILURE_REASON_BILLING_UNVERIFIED
             kwargs["failure_reason"] = failure_reason
+        if model_id:
+            kwargs["model_id"] = model_id
         next_entry = pool.mark_exhausted_and_rotate(**kwargs)
         if next_entry is None:
             return False
@@ -869,12 +879,13 @@ def recover_with_credential_pool(
         return _recover_rate_limit(
             pool, has_retried_429=has_retried_429, error_context=error_context,
             api_key_hint=api_key_hint, credential_id=credential_id, rotate_and_swap=_rotate_and_swap,
+            model_id=model_id,
         )
     if effective_reason == FailoverReason.auth:
         return _recover_auth_failure(
             agent, pool, status_code=status_code, has_retried_429=has_retried_429,
             error_context=error_context, api_key_hint=api_key_hint, credential_id=credential_id,
-            rotate_and_swap=_rotate_and_swap,
+            rotate_and_swap=_rotate_and_swap, model_id=model_id,
         )
     return False, has_retried_429
 

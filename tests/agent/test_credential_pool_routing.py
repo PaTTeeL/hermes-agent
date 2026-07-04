@@ -189,6 +189,7 @@ class TestPoolRotationCycle:
         agent.api_key = "test-api-key"
         agent.provider = "test-provider"
         pool.provider = "test-provider"
+        agent.model = "test-model"
 
         return agent, pool, entries
 
@@ -210,7 +211,7 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         assert has_retried is False  # reset after rotation
-        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None, api_key_hint="test-api-key", failure_reason="rate_limit")
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None, api_key_hint="test-api-key", failure_reason="rate_limit", model_id='test-model')
         agent._swap_credential.assert_called_once_with(entries[1])
 
     def test_pool_exhaustion_returns_false(self):
@@ -246,6 +247,7 @@ class TestPoolRotationCycle:
 
         with patch.object(AIAgent, "__init__", lambda self, **kw: None):
             agent = AIAgent()
+
 
         e0 = MagicMock(name="entry_0")
         e0.id = "cred-0"
