@@ -174,6 +174,39 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
     return "exhausted", True
 
 
+
+def _format_remaining(until_ts: float) -> str:
+    """Format a wall-clock epoch as human-readable remaining time."""
+    remaining = max(0, int(math.ceil(until_ts - time.time())))
+    if remaining == 0:
+        return "expired (ready to retry)"
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m left"
+    if minutes:
+        return f"{minutes}m {seconds}s left"
+    return f"{seconds}s left"
+
+
+def _print_rate_limit_lines(entry, provider: str) -> None:
+    """Print per-model cooldown lines for a credential entry.
+
+    Only shows models whose cooldown has not expired (wall clock — the same
+    domain ``model_cooldowns`` is written in).
+    """
+    from agent.credential_pool_model_cooldowns import model_cooldown_until
+    cooldowns = getattr(entry, "model_cooldowns", None)
+    if not isinstance(cooldowns, dict) or not cooldowns:
+        return
+    now = time.time()
+    for model_id, until in cooldowns.items():
+        if not isinstance(until, (int, float)) or until <= now:
+            continue
+        remaining = _format_remaining(float(until))
+        print(f"      └─ model-cooldown {model_id} ({remaining})")
+
+
 def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
@@ -539,6 +572,10 @@ def auth_list_command(args) -> None:
                 f"id={entry.id} priority={entry.priority} {source}{status} {marker}"
             )
             print(row.rstrip())
+            # Per-model 429 rate-limit TTL — only shown for entries that
+            # have at least one active (unexpired) rate-limit.
+            if getattr(entry, "model_cooldowns", None):
+                _print_rate_limit_lines(entry, provider)
         print()
     if not provider_filter or provider_filter in EXTERNAL_LOGIN_PROVIDERS:
         _print_external_login_notice()
