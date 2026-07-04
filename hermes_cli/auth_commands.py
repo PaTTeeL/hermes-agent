@@ -132,6 +132,42 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 
+def _format_remaining(monotonic_ts: float) -> str:
+    """Format a monotonic timestamp as human-readable remaining time."""
+    remaining = max(0, int(math.ceil(monotonic_ts - time.monotonic())))
+    if remaining == 0:
+        return "expired (ready to retry)"
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m left"
+    if minutes:
+        return f"{minutes}m {seconds}s left"
+    return f"{seconds}s left"
+
+
+def _print_rate_limit_lines(entry, provider: str) -> None:
+    """Print per-model 429 rate-limit TTL lines for a credential entry.
+
+    Only shows models whose TTL has not expired.
+    """
+    from agent.credential_pool import RateLimitEntry
+    rate_limited = getattr(entry, "rate_limited", {})
+    if not isinstance(rate_limited, dict) or not rate_limited:
+        return
+    now = time.monotonic()
+    for model_id, v in rate_limited.items():
+        if isinstance(v, RateLimitEntry):
+            reset_at, consecutive = v.reset_at, v.consecutive_count
+        elif isinstance(v, dict):
+            reset_at, consecutive = v.get("reset_at", 0), v.get("consecutive_count", 0)
+        else:
+            continue
+        if now < reset_at:
+            remaining = _format_remaining(reset_at)
+            print(f"      └─ rate-limited {model_id} ({remaining}, {consecutive} consecutive)")
+
+
 def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
@@ -436,6 +472,10 @@ def auth_list_command(args) -> None:
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
             print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            # Per-model 429 rate-limit TTL — only shown for entries that
+            # have at least one active (unexpired) rate-limit.
+            if getattr(entry, "rate_limited", None):
+                _print_rate_limit_lines(entry, provider)
         print()
 
 

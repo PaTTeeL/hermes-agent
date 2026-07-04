@@ -289,7 +289,7 @@ def _routermint_headers() -> dict:
 
 
 def _pool_may_recover_from_rate_limit(
-    pool, *, provider: str | None = None, base_url: str | None = None
+    pool, *, provider: str | None = None, base_url: str | None = None, model_id: str = ""
 ) -> bool:
     """Decide whether to wait for credential-pool rotation instead of falling back.
 
@@ -307,6 +307,9 @@ def _pool_may_recover_from_rate_limit(
     throttles — even a multi-entry pool shares the same quota window, so
     rotation won't recover.  Skip straight to the fallback for those (#13636).
 
+    When *model_id* is given, also checks per-model rate-limit state: if every
+    pool entry is rate-limited for that model, rotation cannot recover.
+
     In those cases we must fall back to the configured ``fallback_model``
     instead.  Returns True only when rotation has somewhere to go.
 
@@ -316,9 +319,13 @@ def _pool_may_recover_from_rate_limit(
         return False
     if not pool.has_available():
         return False
+    if pool.select(model_id) is None:
+        return False
     # CloudCode / Gemini CLI quotas are account-wide — all pool entries share
     # the same throttle window, so rotation can't recover.  Prefer fallback.
     if str(base_url or "").startswith("cloudcode-pa://"):
+        return False
+    if model_id and not pool._available_entries(model_id=model_id):
         return False
     return len(pool.entries()) > 1
 
@@ -4467,10 +4474,16 @@ class AIAgent:
         has_retried_429: bool,
         classified_reason: Optional[FailoverReason] = None,
         error_context: Optional[Dict[str, Any]] = None,
+        model_id: str = "",
     ) -> tuple[bool, bool]:
         """Forwarder — see ``agent.agent_runtime_helpers.recover_with_credential_pool``."""
         from agent.agent_runtime_helpers import recover_with_credential_pool
-        return recover_with_credential_pool(self, status_code=status_code, has_retried_429=has_retried_429, classified_reason=classified_reason, error_context=error_context)
+        _model_id = model_id or (getattr(self, "model", "") or "")
+        return recover_with_credential_pool(
+            self, status_code=status_code, has_retried_429=has_retried_429,
+            classified_reason=classified_reason, error_context=error_context,
+            model_id=_model_id,
+        )
 
     def _credential_pool_may_recover_rate_limit(self) -> bool:
         """Whether a rate-limit retry should wait for same-provider credentials."""

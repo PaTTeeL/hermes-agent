@@ -5604,7 +5604,7 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 assert status_code == 402
                 assert error_context is None
                 return next_entry
@@ -5625,7 +5625,7 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
                 return next_entry
@@ -5651,7 +5651,7 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 assert status_code == 429
                 assert error_context is None
                 return next_entry
@@ -5756,7 +5756,7 @@ class TestCredentialPoolRecovery:
             def try_refresh_current(self):
                 return None  # refresh failed
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 assert status_code == 401
                 assert error_context is None
                 return next_entry
@@ -5780,7 +5780,7 @@ class TestCredentialPoolRecovery:
             def try_refresh_current(self):
                 return None
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 assert error_context is None
                 return None  # no more credentials
 
@@ -5857,7 +5857,7 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None, model_id=None):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
                 return next_entry

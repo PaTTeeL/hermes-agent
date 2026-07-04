@@ -670,6 +670,7 @@ def recover_with_credential_pool(
     has_retried_429: bool,
     classified_reason: Optional[FailoverReason] = None,
     error_context: Optional[Dict[str, Any]] = None,
+    model_id: str = "",
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation.
 
@@ -782,7 +783,7 @@ def recover_with_credential_pool(
                 current_last_status,
             )
             rotate_status = status_code if status_code is not None else 429
-            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+            next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context, model_id=model_id)
             if next_entry is not None:
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
@@ -804,9 +805,20 @@ def recover_with_credential_pool(
                 or "usage limit has been reached" in context_message
             )
         if not has_retried_429 and not usage_limit_reached:
+            # Record per-model rate-limit TTL even on the first 429 so
+            # _restore_primary_runtime and _do_chain_exhausted_sleep know
+            # when the primary model can be retried.  Without this entry,
+            # single-credential pools (pool_may_recover=False) skip
+            # mark_exhausted_and_rotate entirely and the TTL is never
+            # written — the agent falls to fallback with no record of the
+            # primary's rate-limit window.
+            if model_id:
+                _entry = pool.current() or pool._select_unlocked()
+                if _entry:
+                    pool.mark_rate_limited(_entry, model_id, status_code or 429, error_context)
             return False, True
         rotate_status = status_code if status_code is not None else 429
-        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+        next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context, model_id=model_id)
         if next_entry is not None:
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",

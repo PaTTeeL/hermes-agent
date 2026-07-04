@@ -159,7 +159,7 @@ class TestPoolRotationCycle:
         # mark_exhausted_and_rotate returns next entry until exhausted
         self._rotation_index = 0
 
-        def rotate(status_code=None, error_context=None):
+        def rotate(status_code=None, error_context=None, model_id=None):
             self._rotation_index += 1
             if self._rotation_index < pool_entries:
                 return entries[self._rotation_index]
@@ -170,6 +170,7 @@ class TestPoolRotationCycle:
         agent._credential_pool = pool
         agent._swap_credential = MagicMock()
         agent.log_prefix = ""
+        agent.model = "test-model"
 
         return agent, pool, entries
 
@@ -191,7 +192,7 @@ class TestPoolRotationCycle:
         )
         assert recovered is True
         assert has_retried is False  # reset after rotation
-        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None)
+        pool.mark_exhausted_and_rotate.assert_called_once_with(status_code=429, error_context=None, model_id='test-model')
         agent._swap_credential.assert_called_once_with(entries[1])
 
     def test_pool_exhaustion_returns_false(self):
@@ -226,6 +227,7 @@ class TestPoolRotationCycle:
         with patch.object(AIAgent, "__init__", lambda self, **kw: None):
             agent = AIAgent()
         agent._credential_pool = None
+        agent.model = ""
 
         recovered, has_retried = agent._recover_with_credential_pool(
             status_code=429, has_retried_429=False

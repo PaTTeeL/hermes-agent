@@ -324,6 +324,22 @@ def init_agent(
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+    # Load credential pool for the resolved provider if not already supplied.
+    # For "custom" providers the pool key is "custom:<name>" so resolve via base_url.
+    if agent._credential_pool is None:
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key, load_pool
+            _pool_key = None
+            if agent.provider == "custom":
+                _pool_key = get_custom_provider_pool_key(agent.base_url)
+            if not _pool_key:
+                _pool_key = agent.provider
+            if _pool_key:
+                _pool = load_pool(_pool_key)
+                if _pool.has_credentials():
+                    agent._credential_pool = _pool
+        except Exception:
+            pass
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:

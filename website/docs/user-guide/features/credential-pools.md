@@ -136,12 +136,21 @@ The pool handles different errors differently:
 
 | Error | Behavior | Cooldown |
 |-------|----------|----------|
-| **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 rotates to next key | 1 hour |
+| **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 marks a **per-model** rate limit on that key (other models unaffected) and rotates to next key | 5 min → 10 min → 15 min → 1 hour (TTL escalation, capped) |
 | **402 Billing/Quota** | Immediately rotate to next key | 24 hours |
 | **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | — |
 | **All keys exhausted** | Fall through to `fallback_model` if configured | — |
 
 The `has_retried_429` flag resets on every successful API call, so a single transient 429 doesn't trigger rotation.
+
+Per-model rate limits are scoped to the model that triggered the 429 — a rate-limit on model-A does **not** block model-B on the same credential. Configure TTL escalation via:
+
+```yaml
+credential_pool_strategies:
+  rate_limit_ttl_first_seconds: 300   # first 429 → 5 min
+  rate_limit_ttl_step_seconds: 300    # each consecutive → +5 min
+  rate_limit_ttl_max_seconds: 3600  # cap at 1 hour
+```
 
 ## Custom Endpoint Pools
 
