@@ -12,10 +12,10 @@ import threading
 import time
 import uuid
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
@@ -49,6 +49,13 @@ from hermes_cli.auth import (
     read_credential_pool,
     write_credential_pool,
 )
+
+
+class RateLimitEntry(NamedTuple):
+    """Per-model 429 tracking: reset_at (wall clock time.time(), persisted to auth.json so it survives restarts) and consecutive count."""
+    reset_at: float
+    consecutive_count: int
+
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +171,12 @@ NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
 # Pool key prefix for custom OpenAI-compatible endpoints: all share
 # provider='custom' but are keyed 'custom:<normalized_name>'.
+
+# Default per-model 429 rate-limit TTL escalation (seconds), overridden by
+# credential_pool_strategies in config.yaml.
+RATE_LIMIT_TTL_FIRST_SECONDS  = 5 * 60       # first 429 -> 5 min
+RATE_LIMIT_TTL_STEP_SECONDS   = 5 * 60       # each consecutive -> +5 min
+RATE_LIMIT_TTL_MAX_SECONDS    = 60 * 60      # cap at 1 hour
 CUSTOM_POOL_PREFIX = "custom:"
 
 # Fields only round-tripped through JSON — never used for logic as attributes.

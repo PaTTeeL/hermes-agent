@@ -213,14 +213,110 @@ def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> 
         _quietly(lambda: engine.on_session_end(agent.session_id or "", messages or []))
 
 
-def _pool_may_recover_from_rate_limit(pool) -> bool:
-    """Wait for credential-pool rotation (True) or fall back to ``fallback_model`` (False) after a 429.
+def _pool_may_recover_from_rate_limit(
+    pool, *, provider: str | None = None, base_url: str | None = None, model_id: str = ""
+) -> bool:
+    """Decide whether to wait for credential-pool rotation instead of falling back.
 
-    Rotation only helps when the pool has somewhere to go; a single-credential pool would retry the same quota.
+    The existing pool-rotation path requires the pool to (1) exist and (2) have
+    at least one entry not currently in exhaustion cooldown.  But rotation is
+    only meaningful when the pool has more than one entry.
+
+    With a single-credential pool (common for Vertex service accounts and any
+    "one personal key" configuration), the primary entry just 429'd and there
+    is nothing to rotate to.  Waiting for the pool cooldown to expire means
+    retrying against the same exhausted quota — the daily-quota 429 will recur
+    immediately, and the retry budget is burned.
+
+    Additionally, Google CloudCode / Gemini CLI rate limits are ACCOUNT-level
+    throttles — even a multi-entry pool shares the same quota window, so
+    rotation won't recover.  Skip straight to the fallback for those (#13636).
+
+    When *model_id* is given, also checks per-model rate-limit state: if every
+    pool entry is rate-limited for that model, rotation cannot recover.
+
+    In those cases we must fall back to the configured ``fallback_model``
+    instead.  Returns True only when rotation has somewhere to go.
 
     See issues #11314 and #13636.
     """
-    return pool is not None and pool.has_available() and len(pool.entries()) > 1
+    if pool is None:
+        return False
+    if not pool.has_available():
+        return False
+    # Read-only emptiness check — avoid select() here because it clears
+    # expired rate limits and triggers OAuth refresh as a side effect.
+    if not pool._available_entries(model_id=model_id):
+        # No entry available for this model right now.
+        #
+        # Single-key pool (common for Gemini OAuth, Vertex service accounts,
+        # any "one personal key" setup): nothing to rotate to, but the entry
+        # is either per-model rate-limited (wait for TTL = self-healing) or
+        # simply idle (no 429 record for this model = pass through and let
+        # the request fire).  Either way return True so the caller does NOT
+        # abort with "Rate limited by provider" — that message is only for
+        # the multi-entry case where rotation genuinely can't recover.
+        if len(pool.entries()) <= 1:
+            return True
+        # Multi-key pool: every entry rate-limited for this model. Recovery
+        # is possible only if at least one entry has a per-model TTL not yet
+        # expired (wait = self-healing); otherwise no unlock event to wait
+        # for, fall back.
+        if model_id:
+            from agent.credential_pool import _model_rate_limited_until
+            for _e in pool.entries():
+                if _model_rate_limited_until(_e, model_id) is not None:
+                    return True
+        return False
+    # CloudCode / Gemini CLI quotas are account-wide — all pool entries share
+    # the same throttle window, so rotation can't recover.  Prefer fallback.
+    if str(base_url or "").startswith("cloudcode-pa://"):
+        return False
+    if model_id and not pool._available_entries(model_id=model_id):
+        return False
+    # Either a single-key pool (Gemini OAuth, Vertex service accounts, any
+    # "one personal key" setup) with the entry available for this model, or a
+    # multi-key pool with rotation room. Either way recoverable — return True
+    # so the caller does NOT abort with "Rate limited by provider".
+    return True
+
+
+def _qwen_portal_headers() -> dict:
+    """Return default HTTP headers required by Qwen Portal API."""
+    import platform as _plat
+
+    _ua = f"QwenCode/{_QWEN_CODE_VERSION} ({_plat.system().lower()}; {_plat.machine()})"
+    return {
+        "User-Agent": _ua,
+        "X-DashScope-CacheControl": "enable",
+        "X-DashScope-UserAgent": _ua,
+        "X-DashScope-AuthType": "qwen-oauth",
+    }
+
+
+def _safe_session_filename_component(session_id: str) -> str:
+    """Return a stable, path-safe filename component for a session ID.
+
+    Session IDs can originate from untrusted input (e.g. the
+    ``X-Hermes-Session-Id`` API header) and are otherwise interpolated raw
+    into on-disk artifact filenames under ``~/.hermes/sessions/``.  Without
+    sanitization, a traversal-shaped ID such as ``../../../../etc/pwned``
+    would let a caller write the session snapshot / request dump outside the
+    sessions directory.  This collapses every non ``[A-Za-z0-9_-]`` character
+    to ``_`` (so no path separators or ``.`` survive), caps the length, and —
+    when sanitization changed the string — appends a short content hash so two
+    distinct IDs that sanitize to the same component don't collide.  The
+    result is always a single, traversal-free path segment.
+    """
+    raw = str(session_id or "").strip()
+    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
+    sanitized = sanitized[:96] or "session"
+    if raw and sanitized == raw:
+        return sanitized
+    digest = hashlib.sha256(
+        raw.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()[:12]
+    return f"{sanitized}_{digest}"
 
 
 class _StreamErrorEvent(Exception):
