@@ -184,14 +184,54 @@ def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> 
         _quietly(lambda: engine.on_session_end(agent.session_id or "", messages or []))
 
 
-def _pool_may_recover_from_rate_limit(pool) -> bool:
-    """Wait for credential-pool rotation (True) or fall back to ``fallback_model`` (False) after a 429.
+def _pool_may_recover_from_rate_limit(
+    pool, *, provider: str | None = None, base_url: str | None = None, model_id: str = ""
+) -> bool:
+    """Decide whether to wait for credential-pool rotation instead of falling back.
 
-    Rotation only helps when the pool has somewhere to go; a single-credential pool would retry the same quota.
+    Rotation only helps when the pool has a second entry to rotate to, so these
+    cases must fall back instead:
 
-    See issues #11314 and #13636.
+    * single-key pool (Vertex service accounts, a "one personal key") — the sole
+      entry just 429'd and there is nothing to rotate to.  Return True anyway so
+      the caller retries that entry after its per-model TTL expires, instead of
+      surfacing "Rate limited by provider".
+    * account-level throttles (Google CloudCode / Gemini CLI) — every entry in a
+      multi-key pool shares one quota window, so rotation can't recover (#13636).
+    * every entry is per-model rate-limited for ``model_id`` — there is no pending
+      TTL to wait out, so no unlock event remains.
+
+    Returns True only when rotation has somewhere to go.
     """
-    return pool is not None and pool.has_available() and len(pool.entries()) > 1
+    if pool is None:
+        return False
+    if not pool.has_available():
+        return False
+    # Read-only emptiness check — avoid select() here because it clears
+    # expired rate limits and triggers OAuth refresh as a side effect.
+    if not pool._available_entries(model_id=model_id):
+        # No entry available for this model right now.  Single-key pool:
+        # nothing to rotate to, but the entry is either per-model
+        # rate-limited (wait for TTL = self-healing) or idle — return True
+        # so the caller does NOT abort with "Rate limited by provider".
+        if len(pool.entries()) <= 1:
+            return True
+        # Multi-key pool: every entry rate-limited for this model. Recovery
+        # is possible only if at least one entry has a per-model TTL not yet
+        # expired (wait = self-healing); otherwise fall back.
+        if model_id:
+            from agent.credential_pool import _model_rate_limited_until
+            for _e in pool.entries():
+                if _model_rate_limited_until(_e, model_id) is not None:
+                    return True
+        return False
+    # CloudCode / Gemini CLI quotas are account-wide — all pool entries share
+    # the same throttle window, so rotation can't recover.  Prefer fallback.
+    if str(base_url or "").startswith("cloudcode-pa://"):
+        return False
+    if model_id and not pool._available_entries(model_id=model_id):
+        return False
+    return len(pool.entries()) > 1
 
 
 class _StreamErrorEvent(Exception):

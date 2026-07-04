@@ -482,6 +482,7 @@ def recover_after_classification(
         status_code=status_code, has_retried_429=_retry.has_retried_429,
         classified_reason=classified.reason, error_context=error_context,
         billing_unverified=classified.billing_unverified,
+        model_id=getattr(agent, "model", "") or "",
     )
     if recovered_with_pool:
         return True, recovered_with_pool
