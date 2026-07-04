@@ -798,6 +798,8 @@ def recover_with_credential_pool(
     Rate limits: retry once, then rotate. Billing: rotate immediately. Auth: refresh before
     rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
     usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
+    # Default model_id to the agent's current model when the caller didn't pass one.
+    model_id = model_id or getattr(agent, "model", "") or ""
     pool = agent._credential_pool
     if pool is None:
         return False, has_retried_429
@@ -1115,21 +1117,34 @@ def _rebind_primary_credential_pool(agent, primary_provider, matches_primary, lo
         )
 
 
-def restore_primary_runtime(agent) -> bool:
+def restore_primary_runtime(agent) -> Tuple[bool, Optional[float]]:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
-    (long-lived CLI agents and the gateway's cached agents)."""
+    (long-lived CLI agents and the gateway's cached agents). Returns ``(restored, min_ttl)``
+    where *min_ttl* is the earliest pending per-model rate-limit TTL for the primary model.  A
+    None *min_ttl* means no pending TTL — the caller must not sleep."""
     if not agent._fallback_activated:
         # Reset the index even without activation: a failed _try_activate_fallback() can strand
         # _fallback_index past the chain end and silently block future fallbacks.
         agent._fallback_index = 0
-        return False
-    # Reset the chain index even when no fallback was activated this turn. Without this, a turn where
-    # _try_activate_fallback() was called but returned False (chain exhausted or provider not configured)
-    # leaves _fallback_index >= len(_fallback_chain) while _fallback_activated stays False. The next turn
-    # skips this block entirely, stranding the index and silently blocking all future fallback attempts for
-    # the session. Fixes #20465.
+        agent._fallback_first_ttl = None
+        agent._fallback_min_ttl = None
+        # Surface any pending per-model TTL even with no active fallback, so the first turn
+        # doesn't tight-loop against stale pool rate limits from a previous session.
+        pool = getattr(agent, "_credential_pool", None)
+        if pool is not None:
+            pool_min_ttl = pool.rate_limit_min_ttl(agent.model or "")
+            if pool_min_ttl is not None:
+                return False, pool_min_ttl
+        return False, None
+    # Per-model TTL gate for the primary model: sleep until the earliest 429 reset.
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is not None:
+        primary_model = (agent._primary_runtime or {}).get("model", "") or agent.model or ""
+        pool_min_ttl = pool.rate_limit_min_ttl(primary_model)
+        if pool_min_ttl is not None:
+            return False, pool_min_ttl
     if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-        return False  # primary still in rate-limit cooldown, stay on fallback
+        return False, None  # primary still in rate-limit cooldown, stay on fallback
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
     primary_runtime_base_url = str((rt or {}).get("base_url") or "")
@@ -1183,6 +1198,8 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0
+        agent._fallback_first_ttl = None
+        agent._fallback_min_ttl = None
         # Reset the stale-call circuit breaker: its streak measured the fallback provider.
         from agent.chat_completion_helpers import _reset_stale_streak, rewrite_prompt_model_identity
         _reset_stale_streak(agent)
@@ -1199,10 +1216,10 @@ def restore_primary_runtime(agent) -> bool:
                     f"✅ Primary model restored: {agent.model} via {agent.provider}; "
                     f"fallback {previous_model} via {previous_provider} is no longer active."
                 )
-        return True
+        return True, None
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
-        return False
+        return False, None
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.

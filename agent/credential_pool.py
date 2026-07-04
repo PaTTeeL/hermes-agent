@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import random
 import threading
@@ -76,6 +77,20 @@ def _is_source_suppressed_fn() -> Callable[[str, str], bool]:
         return is_source_suppressed
     except ImportError:
         return lambda _p, _s: False
+
+
+def deterministic_jitter(session_id: str, jitter_max: int) -> int:
+    """Deterministic per-session jitter in seconds.
+
+    sha256(session_id) modulo jitter_max yields a stable 0..jitter_max-1 value:
+    the same session always gets the same offset, reproducible across processes
+    and independent of PYTHONHASHSEED.  Returns 0 (jitter off) when jitter_max
+    <= 0.
+    """
+    if not session_id or jitter_max <= 0:
+        return 0
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % jitter_max
 
 
 # --- Status and type constants ---
@@ -168,6 +183,9 @@ RATE_LIMIT_TTL_FIRST_SECONDS  = 5 * 60       # first 429 → 5 min
 RATE_LIMIT_TTL_STEP_SECONDS   = 5 * 60       # each consecutive → +5 min
 RATE_LIMIT_TTL_MAX_SECONDS    = 60 * 60      # cap at 1 hour
 
+# Max per-session deterministic jitter for the rate-limit sleep (seconds).
+RATE_LIMIT_JITTER_MAX_SECONDS = 30
+
 # Pool key prefix for custom OpenAI-compatible endpoints: all share
 # provider='custom' but are keyed 'custom:<normalized_name>'.
 CUSTOM_POOL_PREFIX = "custom:"
@@ -207,6 +225,33 @@ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     if provider == "anthropic" and isinstance(token, str) and token.startswith("sk-ant-oat"):
         return AUTH_TYPE_OAUTH
     return str(auth_type or AUTH_TYPE_API_KEY)
+
+
+# ── Fallback strategy constants ──────────────────────────────────────
+
+FALLBACK_STRATEGY_STRICT_SEQUENTIAL = "strict_sequential"
+FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST = "primary_else_fastest"
+FALLBACK_STRATEGY_FASTEST_RECOVERY = "fastest_recovery"
+
+SUPPORTED_FALLBACK_STRATEGIES = frozenset({
+    FALLBACK_STRATEGY_STRICT_SEQUENTIAL,
+    FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST,
+    FALLBACK_STRATEGY_FASTEST_RECOVERY,
+})
+
+
+def get_fallback_strategy() -> str:
+    """Read ``credential_pool_strategies.fallback_strategy`` from config.
+
+    Returns the strategy string (one of the FALLBACK_STRATEGY_* constants).
+    Defaults to ``strict_sequential`` if unset or unrecognised.
+    """
+    config = _load_config_safe()
+    strategies = (config or {}).get("credential_pool_strategies", {})
+    val = (strategies.get("fallback_strategy") or "").strip().lower()
+    if val in SUPPORTED_FALLBACK_STRATEGIES:
+        return val
+    return FALLBACK_STRATEGY_STRICT_SEQUENTIAL
 
 
 @dataclass
@@ -2212,7 +2257,8 @@ class CredentialPool:
             extra=entry.extra,
         )
         self._replace_entry(entry, updated)
-        self._persist()
+        if persist:
+            self._persist()
         return updated
 
     def clear_rate_limit(self, entry_id: str, model_id: str) -> None:

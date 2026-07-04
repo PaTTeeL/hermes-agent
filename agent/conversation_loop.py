@@ -20,6 +20,7 @@ from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
+from agent.credential_pool import get_fallback_strategy
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_caching import (
     build_prompt_cache_plan,
@@ -1387,6 +1388,139 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _interruptible_sleep(agent, seconds: float, *, status_msg: Optional[str] = None) -> bool:
+    """Sleep ``seconds`` in 0.2s slices, aborting early on interrupt.
+
+    Returns True if the full duration elapsed, False if ``agent._interrupt_requested``
+    was set during the wait.  Mirrors the inline retry-backoff pattern at line ~1539:
+    0.2s slices with an interrupt check between each, plus a gateway inactivity
+    touch every ~30s so the gateway doesn't reap the session during a long wait.
+
+    Deliberately does NOT touch loop locals (messages / api_call_count /
+    conversation_history) — those belong to the caller's scope.  On interrupt
+    the caller runs its own post-interrupt path (the canonical loop-top check
+    handles it when the caller just ``continue``s).
+
+    Uses ``time.monotonic()`` for in-session precise timing — callers that
+    hold a wall-clock TTL (persisted across restarts) should compute
+    ``remaining = ttl_wall - time.time()`` and pass that as ``seconds``.
+    """
+    if seconds <= 0:
+        return True
+    sleep_end = time.monotonic() + seconds
+    if status_msg:
+        agent._emit_wait_notice(status_msg)
+    _touch = 0
+    while time.monotonic() < sleep_end:
+        if agent._interrupt_requested:
+            return False
+        time.sleep(0.2)
+        _touch += 1
+        if _touch % 150 == 0 and status_msg:  # 150 × 0.2s = 30s gateway touch
+            agent._emit_wait_notice(
+                f"{status_msg} (~{max(0, sleep_end - time.monotonic()):.0f}s left)..."
+            )
+    return True
+
+
+def _do_chain_exhausted_sleep(
+    agent,
+    strategy: str,
+    primary_min_ttl: Optional[float],
+    fallback_first_ttl: Optional[float],
+    fallback_min_ttl: Optional[float],
+) -> None:
+    """Sleep until a 429 rate-limit TTL expires, or abort if none will.
+
+    Called from the 429 path after ``_try_activate_fallback`` returns False
+    (chain exhausted).  All TTLs (P, F1, Fm) are passed by the caller;
+    this function only computes sleep_until per strategy and sleeps once.
+
+    =================  =============== ====================================
+    Strategy           Candidates       sleep_until
+    =================  =============== ====================================
+    strict_sequential  P>0 ? {P} : {F1}  P if P>0 else F1
+    primary_else_fastest P>0 ? {P} : {Fm} P if P>0 else Fm
+    fastest_recovery   {P, Fm}           min(P, Fm)
+    =================  =============== ====================================
+
+    P  = primary_min_ttl    — min remaining TTL across primary pool
+    F1 = fallback_first_ttl — TTL of first alive fallback (chain order)
+    Fm = fallback_min_ttl   — min remaining TTL across all fallbacks
+
+    None means the entry is not 429-rate-limited (its failure stems from a
+    non-429 error).  If no entry has a pending TTL (all are None), there
+    is no unlock event to wait for — the function returns immediately
+    (caller aborts).
+
+    When P>0, both ``strict_sequential`` and ``primary_else_fastest``
+    wait only for the primary model; the difference only appears when P
+    is None:
+
+    - ``strict_sequential`` waits for the first alive fallback (F1),
+    - ``primary_else_fastest`` waits for the fastest alive fallback (Fm).
+    """
+    now = time.time()
+
+    # Compute sleep_until per strategy
+    if strategy == "strict_sequential":
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_first_ttl
+    elif strategy == "primary_else_fastest":
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_min_ttl
+    elif strategy == "fastest_recovery":
+        candidates = [t for t in [primary_min_ttl, fallback_min_ttl] if t is not None]
+        sleep_until = min(candidates) if candidates else None
+    else:
+        logger.warning("Unknown fallback_strategy %r, falling back to strict_sequential", strategy)
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_first_ttl
+
+    if sleep_until is None or sleep_until <= now:
+        return
+
+    # Before retrying, re-read the on-disk reset_at; if it moved past our
+    # sleep_until, wait for the new value instead.
+    while True:
+        wait = sleep_until - time.time()
+        if wait <= 0:
+            return
+        _interruptible_sleep(
+            agent, wait,
+            status_msg=f"\u23f3 All fallbacks exhausted \u2014 waiting {wait:.0f}s...",
+        )
+        # Re-read the on-disk reset_at.
+        _disk_rat = None
+        try:
+            from hermes_cli.auth import read_credential_pool as _rcp
+            _prov = getattr(agent, "provider", None)
+            _mdl = getattr(agent, "model", None) or ""
+            if _prov and _mdl:
+                _disk_entries = _rcp(_prov)
+                if isinstance(_disk_entries, list):
+                    _ce_id = getattr(agent, "_credential_pool_entry_id", None)
+                    _disk_e = next(
+                        (d for d in _disk_entries
+                         if isinstance(d, dict) and d.get("id") == _ce_id),
+                        None,
+                    )
+                    if isinstance(_disk_e, dict):
+                        _disk_rl = _disk_e.get("rate_limited")
+                        if isinstance(_disk_rl, dict):
+                            _dv = _disk_rl.get(_mdl)
+                            if isinstance(_dv, dict):
+                                _ra = _dv.get("reset_at")
+                                try:
+                                    _disk_rat = float(_ra) if _ra is not None else None
+                                except (TypeError, ValueError):
+                                    _disk_rat = None
+        except Exception:
+            _disk_rat = None
+        # On-disk reset_at moved past our sleep_until → wait for the new value.
+        if _disk_rat is not None and _disk_rat > time.time() and _disk_rat > sleep_until:
+            sleep_until = _disk_rat
+            continue
+        return
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1454,6 +1588,9 @@ def run_conversation(
     # thinking-only-truncation one-shot must not survive an interrupted turn; credential-
     # pool refresh tallies cap same-entry refreshes on a persistent 401 (#26080); usage
     # for on_turn_complete() stays None on turns that never reach a response.
+    strategy = get_fallback_strategy()
+    primary_model = (agent._primary_runtime or {}).get("model", "") or agent.model or ""
+    primary_recovery_attempted = False
     agent._delivered_interim_texts = set()
     agent._incremental_persistence_failed = False
     agent._last_persistence_error_cause = None

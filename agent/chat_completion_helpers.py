@@ -1900,8 +1900,34 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
-        logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
+        logger.warning(
+            "Fallback skip: %s/%s is not locally usable (%s); suppressing for this session",
+            fb_provider,
+            fb_model,
+            local_skip_reason,
+        )
         return True
+
+    # Track per-model rate-limit TTLs as we walk the chain so the caller
+    # can pass F1/Fm to _do_chain_exhausted_sleep() if everything fails.
+    try:
+        from agent.credential_pool import load_pool as _load_pool
+        _fb_pool = _load_pool(fb_provider)
+        _fb_t = _fb_pool.rate_limit_min_ttl(fb_model)
+        if _fb_t is not None:
+            if getattr(agent, "_fallback_first_ttl", None) is None:
+                agent._fallback_first_ttl = _fb_t
+            _cur_min = getattr(agent, "_fallback_min_ttl", None)
+            if _cur_min is not None:
+                agent._fallback_min_ttl = min(_cur_min, _fb_t)
+            else:
+                agent._fallback_min_ttl = _fb_t
+    except Exception as _ttl_err:
+        logger.debug(
+            "try_activate_fallback: per-model TTL lookup failed for %s/%s — %s",
+            fb_provider, fb_model, _ttl_err,
+        )
+
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.

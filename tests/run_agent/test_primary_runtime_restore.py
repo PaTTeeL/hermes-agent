@@ -142,7 +142,27 @@ class TestRestorePrimaryRuntime:
     def test_noop_when_not_fallback(self):
         agent = _make_agent()
         assert agent._fallback_activated is False
-        assert agent._restore_primary_runtime() is False
+        restored, _ = agent._restore_primary_runtime(); assert not restored
+
+    def test_resets_index_when_fallback_not_activated(self):
+        """Regression for #20465: failed activation leaves _fallback_index advanced
+        with _fallback_activated=False; the next turn's restore must reset the index."""
+        fbs = [{"provider": "custom", "model": "gpt-oss:20b",
+                "base_url": "http://host.docker.internal:11434/v1", "api_key": "ollama"}]
+        agent = _make_agent(fallback_model=fbs)
+
+        # resolve_provider_client returns None → _try_activate_fallback returns False
+        # but _fallback_index has already been incremented to 1
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)):
+            assert agent._try_activate_fallback() is False
+
+        assert agent._fallback_activated is False
+        assert agent._fallback_index == 1  # advanced past the only entry
+
+        # _restore_primary_runtime must reset the index so the next turn can retry
+        result = agent._restore_primary_runtime()
+        assert result[0] is False  # still no-op (primary was never left)
+        assert agent._fallback_index == 0  # chain available again
 
     def test_restores_model_and_provider(self):
         agent = _make_agent(
@@ -164,7 +184,7 @@ class TestRestorePrimaryRuntime:
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
@@ -187,7 +207,7 @@ class TestRestorePrimaryRuntime:
         emitted = []
         agent._emit_status = emitted.append
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
 
         assert emitted == [
             f"✅ Primary model restored: {original_model} via {original_provider}; "
@@ -204,7 +224,7 @@ class TestRestorePrimaryRuntime:
         agent._emit_status = emitted.append
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
 
         assert emitted == []
 
@@ -231,8 +251,8 @@ class TestRestorePrimaryRuntime:
                 side_effect=[RuntimeError("transient restore failure"), None],
             ),
         ):
-            assert agent._restore_primary_runtime() is False
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is False
+            assert agent._restore_primary_runtime()[0] is True
 
         assert emitted == [
             "✅ Primary model restored: primary-model via custom; "
@@ -303,7 +323,7 @@ class TestRestorePrimaryRuntime:
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent.request_overrides == original_overrides
         assert agent.request_overrides is not agent._primary_runtime["request_overrides"]
 
@@ -327,6 +347,9 @@ class TestRestorePrimaryRuntime:
             def select(self):
                 return _Entry()
 
+            def rate_limit_min_ttl(self, model_id):
+                return None
+
         agent = _make_agent(
             provider="custom",
             base_url="https://primary.example.com/v1",
@@ -342,7 +365,7 @@ class TestRestorePrimaryRuntime:
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent.provider == "custom"
         assert agent.base_url == original_base_url
         agent._swap_credential.assert_not_called()
@@ -375,6 +398,9 @@ class TestRestorePrimaryRuntime:
             def select(self):
                 return _DeepseekEntry()
 
+            def rate_limit_min_ttl(self, model_id):
+                return None
+
         agent = _make_agent(
             provider="openai-api",
             base_url="https://api.openai.com/v1",
@@ -401,7 +427,7 @@ class TestRestorePrimaryRuntime:
         ):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent.provider == primary_provider
         assert agent.base_url == primary_base_url
         assert "deepseek" not in str(agent.base_url)
@@ -418,6 +444,8 @@ class TestRestorePrimaryRuntime:
         agent._fallback_activated = True
         fallback_pool = MagicMock()
         fallback_pool.provider = "deepseek"
+        # No per-model rate-limit TTL pending — pure "reload failed → clear" path.
+        fallback_pool.rate_limit_min_ttl.return_value = None
         agent._credential_pool = fallback_pool
 
         with (
@@ -429,7 +457,7 @@ class TestRestorePrimaryRuntime:
         ):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent.provider == "openai-api"
         assert agent._credential_pool is None
 
@@ -454,6 +482,9 @@ class TestRestorePrimaryRuntime:
             def select(self):
                 return _Entry()
 
+            def rate_limit_min_ttl(self, model_id):
+                return None
+
         agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
         agent._fallback_activated = True
         agent._credential_pool = _Pool()
@@ -468,7 +499,7 @@ class TestRestorePrimaryRuntime:
         ):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         agent._swap_credential.assert_called_once()
 
     def test_restore_reloads_named_custom_pool_by_scoped_key(self):
@@ -483,9 +514,11 @@ class TestRestorePrimaryRuntime:
         primary_pool.provider = "custom:gemini-display"
         primary_pool.has_available.return_value = True
         primary_pool.select.return_value = _Entry()
+        primary_pool.rate_limit_min_ttl.return_value = None
 
         fallback_pool = MagicMock()
         fallback_pool.provider = "openrouter"
+        fallback_pool.rate_limit_min_ttl.return_value = None
         agent = _make_agent(
             provider="custom:gemini-no-filter",
             base_url="https://generativelanguage.googleapis.com/v1beta",
@@ -515,7 +548,7 @@ class TestRestorePrimaryRuntime:
         ):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent._credential_pool is primary_pool
         load_pool.assert_called_once_with("gemini-no-filter")
         agent._swap_credential.assert_called_once_with(primary_pool.select.return_value)
@@ -523,6 +556,7 @@ class TestRestorePrimaryRuntime:
     def test_restore_named_custom_pool_wrong_endpoint_fails_closed(self):
         pool = MagicMock()
         pool.provider = "custom:gemini-no-filter"
+        pool.rate_limit_min_ttl.return_value = None
         agent = _make_agent(
             provider="gemini-no-filter",
             base_url="https://fallback.example/v1",
@@ -546,12 +580,107 @@ class TestRestorePrimaryRuntime:
         ):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent._credential_pool is None
         load_pool.assert_called_once_with("gemini-no-filter")
         agent._swap_credential.assert_not_called()
 
 
+        class _Entry:
+            provider = "custom:otherllm"
+            id = "other-entry"
+            label = "otherllm"
+            runtime_api_key = "other-key"
+            runtime_base_url = "https://my-llm.example.com/v1"
+            access_token = "other-key"
+
+        class _Pool:
+            provider = "custom:otherllm"
+
+            def has_available(self):
+                return True
+
+            def select(self):
+                return _Entry()
+
+            def rate_limit_min_ttl(self, model_id):
+                return None
+
+        agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+        agent._fallback_activated = True
+        original_base_url = agent.base_url
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        with (
+            patch(
+                "agent.credential_pool.get_custom_provider_pool_key",
+                return_value="custom:myllm",  # primary resolves to a DIFFERENT key
+            ),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+        ):
+            result = agent._restore_primary_runtime()
+
+        assert result[0] is True
+        assert agent.base_url == original_base_url
+        agent._swap_credential.assert_not_called()
+
+    def test_restore_survives_exception(self):
+        """If client rebuild fails, the method returns False gracefully."""
+        agent = _make_agent()
+        agent._fallback_activated = True
+
+        with patch("agent.process_bootstrap.OpenAI", side_effect=Exception("connection refused")):
+            result = agent._restore_primary_runtime()
+
+        assert result[0] is False  # still not restored
+
+    def test_returns_pool_min_ttl_when_not_fallback(self):
+        """When _fallback_activated=False but pool has per-model rate-limit,
+        returns (False, min_ttl) so callers can sleep-anchor without bailing."""
+        agent = _make_agent()
+        assert agent._fallback_activated is False
+
+        future_ttl = time.monotonic() + 300
+
+        class _Pool:
+            def rate_limit_min_ttl(self, model_id):
+                return future_ttl
+
+        agent._credential_pool = _Pool()
+        agent._fallback_index = 1  # simulate stale index from a failed attempt
+
+        restored, min_ttl = agent._restore_primary_runtime()
+
+        assert restored is False
+        assert min_ttl == future_ttl
+        # Index must still be reset even though we returned early
+        assert agent._fallback_index == 0
+
+    def test_pool_min_ttl_takes_precedence_over_global_cooldown(self):
+        """When fallback is active and pool has per-model TTL for the primary
+        model, pool_min_ttl is returned before checking _rate_limited_until."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+
+        assert agent._fallback_activated is True
+        pool_ttl = time.time() + 300
+        agent._rate_limited_until = time.time() + 60  # shorter global cooldown
+
+        class _Pool:
+            def rate_limit_min_ttl(self, model_id):
+                return pool_ttl  # longer than _rate_limited_until
+
+        agent._credential_pool = _Pool()
+
+        restored, min_ttl = agent._restore_primary_runtime()
+
+        assert restored is False
+        assert min_ttl == pool_ttl  # pool TTL returned, not the shorter global one
 
 
 # =============================================================================
@@ -721,7 +850,7 @@ class TestRestoreInRunConversation:
 
         # Turn 2: restore primary
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            restored, _ = agent._restore_primary_runtime(); assert restored
 
         assert agent._fallback_activated is False
         assert agent._fallback_index == 0
@@ -747,13 +876,35 @@ class TestRateLimitCooldown:
 
         assert agent._fallback_activated is True
 
-        # Manually set cooldown well into the future
-        agent._rate_limited_until = time.monotonic() + 60
+        # Manually set cooldown well into the future.
+        # NB: _rate_limited_until lives in wall-clock (time.time()) domain,
+        # matching restore_primary_runtime's comparison.
+        agent._rate_limited_until = time.time() + 60
 
         result = agent._restore_primary_runtime()
-        assert result is False
+        assert result[0] is False
         assert agent._fallback_activated is True  # still on fallback
 
+    def test_restore_allowed_after_cooldown_expires(self):
+        """Once the cooldown window passes, restore proceeds normally."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+
+        assert agent._fallback_activated is True
+
+        # Cooldown already expired (monotonic domain, matching
+        # restore_primary_runtime's comparison).
+        agent._rate_limited_until = time.monotonic() - 1
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            result = agent._restore_primary_runtime()
+
+        assert result[0] is True
+        assert agent._fallback_activated is False
 
     def test_cooldown_set_on_rate_limit_reason(self):
         """_try_activate_fallback with rate_limit reason sets _rate_limited_until."""
@@ -864,5 +1015,5 @@ class TestSwitchModelRequestOverridesSnapshot:
         agent.request_overrides = {"extra_body": {"fallback_only": True}}
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
-        assert result is True
+        assert result[0] is True
         assert agent.request_overrides == overrides
