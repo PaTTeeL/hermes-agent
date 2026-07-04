@@ -1110,7 +1110,7 @@ def drop_thinking_only_and_merge_users(
 
 
 
-def restore_primary_runtime(agent) -> bool:
+def restore_primary_runtime(agent) -> Tuple[bool, Optional[float]]:
     """Restore the primary runtime at the start of a new turn.
 
     In long-lived CLI sessions a single AIAgent instance spans multiple
@@ -1120,6 +1120,12 @@ def restore_primary_runtime(agent) -> bool:
 
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
+
+    Returns (restored: bool, min_ttl: Optional[float]).  *min_ttl* is the
+    earliest per-model rate-limit TTL across all pool entries for the
+    primary model (``time.monotonic()`` timestamp), or None when restored
+    or when no 429 rate-limit is pending.  A value of None means "no
+    pending TTL" — the caller must NOT sleep.
     """
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
@@ -1130,10 +1136,33 @@ def restore_primary_runtime(agent) -> bool:
         # entirely, stranding the index and silently blocking all future
         # fallback attempts for the session.  Fixes #20465.
         agent._fallback_index = 0
-        return False
+        agent._fallback_first_ttl = None
+        agent._fallback_min_ttl = None
+        # Even with no active fallback, check per-model pool TTL so
+        # that a pending TTL is surfaced as min_ttl (preventing
+        # tight-looping on the first turn when pool entries carry stale
+        # rate limits from a previous session).
+        pool = getattr(agent, "_credential_pool", None)
+        if pool is not None:
+            model = agent.model or ""
+            pool_min_ttl = pool.rate_limit_min_ttl(model)
+            if pool_min_ttl is not None:
+                return False, pool_min_ttl
+        return False, None
 
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
-        return False  # primary still in rate-limit cooldown, stay on fallback
+    # -- Check per-model pool TTL for the primary model --
+    pool = getattr(agent, "_credential_pool", None)
+    pool_min_ttl: Optional[float] = None
+    if pool is not None:
+        primary_model = (agent._primary_runtime or {}).get("model", "") or agent.model or ""
+        pool_min_ttl = pool.rate_limit_min_ttl(primary_model)
+    if pool_min_ttl is not None:
+        return False, pool_min_ttl
+
+    # Fall back to global rate-limit cooldown (set by _try_activate_fallback)
+    rl_until = getattr(agent, "_rate_limited_until", 0)
+    if rl_until > time.monotonic():
+        return False, rl_until
 
     rt = agent._primary_runtime
     try:
@@ -1249,6 +1278,8 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+        agent._fallback_first_ttl = None
+        agent._fallback_min_ttl = None
 
         # Undo the fallback's identity rewrite so the prompt is
         # byte-identical to the stored copy again (prefix cache match).
@@ -1259,10 +1290,10 @@ def restore_primary_runtime(agent) -> bool:
             "Primary runtime restored for new turn: %s (%s)",
             agent.model, agent.provider,
         )
-        return True
+        return True, None
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
-        return False
+        return False, None
 
 # Which error types indicate a transient transport failure worth
 # one more attempt with a rebuilt client / connection pool.

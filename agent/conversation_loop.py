@@ -31,6 +31,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.credential_pool import get_fallback_strategy, load_pool
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
@@ -515,6 +516,67 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     return sp
 
 
+def _do_chain_exhausted_sleep(
+    agent,
+    strategy: str,
+    primary_min_ttl: Optional[float],
+    fallback_first_ttl: Optional[float],
+    fallback_min_ttl: Optional[float],
+) -> None:
+    """Sleep until a 429 rate-limit TTL expires, or abort if none will.
+
+    Called from the 429 path after ``_try_activate_fallback`` returns False
+    (chain exhausted).  All TTLs (P, F1, Fm) are passed by the caller;
+    this function only computes sleep_until per strategy and sleeps once.
+
+    =================  =============== ====================================
+    Strategy           Candidates       sleep_until
+    =================  =============== ====================================
+    strict_sequential  P>0 ? {P} : {F1}  P if P>0 else F1
+    primary_else_fastest P>0 ? {P} : {Fm} P if P>0 else Fm
+    fastest_recovery   {P, Fm}           min(P, Fm)
+    =================  =============== ====================================
+
+    P  = primary_min_ttl    — min remaining TTL across primary pool
+    F1 = fallback_first_ttl — TTL of first alive fallback (chain order)
+    Fm = fallback_min_ttl   — min remaining TTL across all fallbacks
+
+    None means the entry is not 429-rate-limited (its failure stems from a
+    non-429 error).  If no entry has a pending TTL (all are None), there
+    is no unlock event to wait for — the function returns immediately
+    (caller aborts).
+
+    When P>0, both ``strict_sequential`` and ``primary_else_fastest``
+    wait only for the primary model; the difference only appears when P
+    is None:
+
+    - ``strict_sequential`` waits for the first alive fallback (F1),
+    - ``primary_else_fastest`` waits for the fastest alive fallback (Fm).
+    """
+    now = time.monotonic()
+
+    # Compute sleep_until per strategy
+    if strategy == "strict_sequential":
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_first_ttl
+    elif strategy == "primary_else_fastest":
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_min_ttl
+    elif strategy == "fastest_recovery":
+        candidates = [t for t in [primary_min_ttl, fallback_min_ttl] if t is not None]
+        sleep_until = min(candidates) if candidates else None
+    else:
+        logger.warning("Unknown fallback_strategy %r, falling back to strict_sequential", strategy)
+        sleep_until = primary_min_ttl if primary_min_ttl is not None else fallback_first_ttl
+
+    if sleep_until is None or sleep_until <= now:
+        return
+
+    wait = sleep_until - now
+    agent._buffer_status(
+        f"\u23f3 All fallbacks exhausted \u2014 waiting {wait:.0f}s..."
+    )
+    time.sleep(wait)
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -566,8 +628,7 @@ def run_conversation(
     # build, crash-resilience persistence, preflight compression, the
     # ``pre_llm_call`` plugin hook, and external-memory prefetch — lives in
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
-    # did and returns the locals the loop below reads back.  See
-    # ``agent/turn_context.py``.
+    # did and returns the locals the loop below reads back.
     _ctx = build_turn_context(
         agent,
         user_message,
@@ -596,6 +657,9 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    strategy = get_fallback_strategy()
+    primary_model = (agent._primary_runtime or {}).get("model", "") or agent.model or ""
+    primary_recovery_attempted = False
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -2517,9 +2581,66 @@ def run_conversation(
                     has_retried_429=_retry.has_retried_429,
                     classified_reason=classified.reason,
                     error_context=error_context,
+                    model_id=agent.model or "",
                 )
                 if recovered_with_pool:
                     continue
+                # ── 429 first-attempt → eager-fallback bridge ──────────
+                # When this is the FIRST 429 in a retry cycle,
+                # recover_with_credential_pool has already written the
+                # per-model TTL (mark_rate_limited) and set has_retried_429
+                # = True.  The correct next action is eager-fallback — not
+                # incrementing retry_count, not printing "attempt N/M", and
+                # not sleeping a backoff.  Jump directly to the eager-
+                # fallback block so a configured chain activates on the
+                # first 429 rather than burning through retries that can't
+                # possibly succeed (the primary model's TTL window won't
+                # expire inside a retry loop).  See issue #35008.
+                #
+                # When the chain is empty or exhausted, the eager-fallback
+                # guard will log "429 did NOT enter eager-fallback" and the
+                # caller must bail instead of entering the retry-count /
+                # backoff path — the backoff loop would burn all remaining
+                # retries on the same 429 with no chance of success.
+                if _retry.has_retried_429 and classified.reason == FailoverReason.rate_limit:
+                    _chain_len = len(getattr(agent, "_fallback_chain", []) or [])
+                    if _chain_len > 0:
+                        # Has a chain — fall through to eager-fallback below.
+                        # The image/long-context/oauth blocks in between are
+                        # no-ops for 429 and just pass through.
+                        pass
+                    else:
+                        # No fallback configured — don't burn retries.
+                        # Abort with a clear message so the user knows
+                        # the model is rate-limited rather than thinking
+                        # the API is generally down.
+                        _rl_entry = agent._restore_primary_runtime()
+                        _rl_ttl_info = ""
+                        if _rl_entry[1] is not None:
+                            _rl_remaining = max(0, _rl_entry[1] - time.monotonic())
+                            _rl_ttl_info = (
+                                f" TTL expires in {_rl_remaining:.0f}s."
+                            )
+                        _rl_msg = (
+                            f"❌ Rate limited by provider.{_rl_ttl_info}"
+                            "  Configure fallback_providers in config.yaml"
+                            " to avoid downtime."
+                        )
+                        agent._emit_status(_rl_msg)
+                        logger.error(
+                            "%s429 with no fallback chain — aborting turn after first occurrence. provider=%s model=%s",
+                            agent.log_prefix,
+                            getattr(agent, "provider", "?"),
+                            agent.model or "",
+                        )
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _rl_msg,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "rate_limited": True,
+                        }
 
                 # Image-too-large recovery: shrink oversized native image
                 # parts in-place and retry once.  Triggered by Anthropic's
@@ -3066,7 +3187,15 @@ def run_conversation(
                             agent._credential_pool,
                             provider=agent.provider,
                             base_url=getattr(agent, "base_url", None),
+                            model_id=agent.model or "",
                         )
+                    )
+                    logger.info(
+                        "%s429 eager-fallback check: is_rate_limited=%s fallback_index=%d/%d pool_may_recover=%s provider=%s model=%s",
+                        agent.log_prefix, is_rate_limited,
+                        agent._fallback_index, len(agent._fallback_chain),
+                        pool_may_recover,
+                        getattr(agent, "provider", "?"), agent.model or "",
                     )
                     if not pool_may_recover:
                         if _is_upstream:
@@ -3079,14 +3208,16 @@ def run_conversation(
                             )
                         elif classified.reason == FailoverReason.billing:
                             agent._buffer_status(
-                                "⚠️ Billing or credits exhausted — switching to fallback provider..."
+                                "\u26a0\ufe0f Billing or credits exhausted \u2014 switching to fallback provider..."
                             )
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                            agent._buffer_status("\u26a0\ufe0f Rate limited \u2014 switching to fallback provider...")
+                        # Chain exhausted — sleep per fallback_strategy if any
+                        # entry has TTL > 0, otherwise abort.
                         if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -3094,6 +3225,14 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+                        _, primary_min_ttl = agent._restore_primary_runtime()
+                        _do_chain_exhausted_sleep(agent, strategy,
+                            primary_min_ttl,
+                            agent._fallback_first_ttl,
+                            agent._fallback_min_ttl)
+                        compression_attempts = 0
+                        _retry.primary_recovery_attempted = False
+                        continue
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
@@ -3129,6 +3268,15 @@ def run_conversation(
                         continue
 
                 # ── Nous Portal: record rate limit & skip retries ─────
+                # (also serves as diagnostic: if we reached here with a 429,
+                # the eager-fallback guard above was not entered)
+                if is_rate_limited:
+                    logger.info(
+                        "%s429 did NOT enter eager-fallback: is_rate_limited=%s fallback_index=%d/%d provider=%s model=%s",
+                        agent.log_prefix, is_rate_limited,
+                        agent._fallback_index, len(agent._fallback_chain),
+                        getattr(agent, "provider", "?"), agent.model or "",
+                    )
                 # When Nous returns a 429 that is a genuine account-
                 # level rate limit, record the reset time to a shared
                 # file so ALL sessions (cron, gateway, auxiliary) know

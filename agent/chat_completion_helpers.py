@@ -1177,6 +1177,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     can continue with the new backend.  Advances through the chain on
     each call; returns False when exhausted.
 
+    Sleep responsibility is intentionally left to the caller so the control
+    flow is explicit and predictable.  Callers that need to wait for a
+    primary rate-limit TTL should sleep AFTER this returns False, using
+    the min_ttl obtained from ``restore_primary_runtime`` before calling
+    this function.
+
     Uses the centralized provider router (resolve_provider_client) for
     auth resolution and client construction — no duplicated provider→key
     mappings.
@@ -1232,6 +1238,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             local_skip_reason,
         )
         return agent._try_activate_fallback(reason)
+
+    # Track per-model rate-limit TTLs as we walk the chain so the caller
+    # can pass F1/Fm to _do_chain_exhausted_sleep() if everything fails.
+    try:
+        from agent.credential_pool import load_pool as _load_pool
+        _fb_pool = _load_pool(fb_provider)
+        _fb_t = _fb_pool.rate_limit_min_ttl(fb_model)
+        if _fb_t is not None:
+            if getattr(agent, "_fallback_first_ttl", None) is None:
+                agent._fallback_first_ttl = _fb_t
+            _cur_min = getattr(agent, "_fallback_min_ttl", None)
+            if _cur_min is not None:
+                agent._fallback_min_ttl = min(_cur_min, _fb_t)
+            else:
+                agent._fallback_min_ttl = _fb_t
+    except Exception:
+        pass
 
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare

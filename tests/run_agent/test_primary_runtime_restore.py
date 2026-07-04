@@ -119,7 +119,27 @@ class TestRestorePrimaryRuntime:
     def test_noop_when_not_fallback(self):
         agent = _make_agent()
         assert agent._fallback_activated is False
-        assert agent._restore_primary_runtime() is False
+        restored, _ = agent._restore_primary_runtime(); assert not restored
+
+    def test_resets_index_when_fallback_not_activated(self):
+        """Regression for #20465: failed activation leaves _fallback_index advanced
+        with _fallback_activated=False; the next turn's restore must reset the index."""
+        fbs = [{"provider": "custom", "model": "gpt-oss:20b",
+                "base_url": "http://host.docker.internal:11434/v1", "api_key": "ollama"}]
+        agent = _make_agent(fallback_model=fbs)
+
+        # resolve_provider_client returns None → _try_activate_fallback returns False
+        # but _fallback_index has already been incremented to 1
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)):
+            assert agent._try_activate_fallback() is False
+
+        assert agent._fallback_activated is False
+        assert agent._fallback_index == 1  # advanced past the only entry
+
+        # _restore_primary_runtime must reset the index so the next turn can retry
+        result = agent._restore_primary_runtime()
+        assert result[0] is False  # still no-op (primary was never left)
+        assert agent._fallback_index == 0  # chain available again
 
     def test_restores_model_and_provider(self):
         agent = _make_agent(
@@ -141,7 +161,7 @@ class TestRestorePrimaryRuntime:
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
@@ -382,7 +402,54 @@ class TestRestorePrimaryRuntime:
         with patch("run_agent.OpenAI", side_effect=Exception("connection refused")):
             result = agent._restore_primary_runtime()
 
-        assert result is False
+        assert result[0] is False  # still not restored
+
+    def test_returns_pool_min_ttl_when_not_fallback(self):
+        """When _fallback_activated=False but pool has per-model rate-limit,
+        returns (False, min_ttl) so callers can sleep-anchor without bailing."""
+        agent = _make_agent()
+        assert agent._fallback_activated is False
+
+        future_ttl = time.monotonic() + 300
+
+        class _Pool:
+            def rate_limit_min_ttl(self, model_id):
+                return future_ttl
+
+        agent._credential_pool = _Pool()
+        agent._fallback_index = 1  # simulate stale index from a failed attempt
+
+        restored, min_ttl = agent._restore_primary_runtime()
+
+        assert restored is False
+        assert min_ttl == future_ttl
+        # Index must still be reset even though we returned early
+        assert agent._fallback_index == 0
+
+    def test_pool_min_ttl_takes_precedence_over_global_cooldown(self):
+        """When fallback is active and pool has per-model TTL for the primary
+        model, pool_min_ttl is returned before checking _rate_limited_until."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+
+        assert agent._fallback_activated is True
+        pool_ttl = time.monotonic() + 300
+        agent._rate_limited_until = time.monotonic() + 60  # shorter global cooldown
+
+        class _Pool:
+            def rate_limit_min_ttl(self, model_id):
+                return pool_ttl  # longer than _rate_limited_until
+
+        agent._credential_pool = _Pool()
+
+        restored, min_ttl = agent._restore_primary_runtime()
+
+        assert restored is False
+        assert min_ttl == pool_ttl  # pool TTL returned, not the shorter global one
 
 
 # =============================================================================
@@ -611,7 +678,7 @@ class TestRestoreInRunConversation:
 
         # Turn 2: restore primary
         with patch("run_agent.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            restored, _ = agent._restore_primary_runtime(); assert restored
 
         assert agent._fallback_activated is False
         assert agent._fallback_index == 0
@@ -641,7 +708,7 @@ class TestRateLimitCooldown:
         agent._rate_limited_until = time.monotonic() + 60
 
         result = agent._restore_primary_runtime()
-        assert result is False
+        assert result[0] is False
         assert agent._fallback_activated is True  # still on fallback
 
     def test_restore_allowed_after_cooldown_expires(self):
@@ -661,7 +728,7 @@ class TestRateLimitCooldown:
         with patch("run_agent.OpenAI", return_value=MagicMock()):
             result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert agent._fallback_activated is False
 
     def test_cooldown_set_on_rate_limit_reason(self):

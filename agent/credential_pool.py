@@ -140,6 +140,33 @@ _EXTRA_KEYS = frozenset({
 })
 
 
+# ── Fallback strategy constants ──────────────────────────────────────
+
+FALLBACK_STRATEGY_STRICT_SEQUENTIAL = "strict_sequential"
+FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST = "primary_else_fastest"
+FALLBACK_STRATEGY_FASTEST_RECOVERY = "fastest_recovery"
+
+SUPPORTED_FALLBACK_STRATEGIES = frozenset({
+    FALLBACK_STRATEGY_STRICT_SEQUENTIAL,
+    FALLBACK_STRATEGY_PRIMARY_ELSE_FASTEST,
+    FALLBACK_STRATEGY_FASTEST_RECOVERY,
+})
+
+
+def get_fallback_strategy() -> str:
+    """Read ``credential_pool_strategies.fallback_strategy`` from config.
+
+    Returns the strategy string (one of the FALLBACK_STRATEGY_* constants).
+    Defaults to ``strict_sequential`` if unset or unrecognised.
+    """
+    config = _load_config_safe()
+    strategies = (config or {}).get("credential_pool_strategies", {})
+    val = (strategies.get("fallback_strategy") or "").strip().lower()
+    if val in SUPPORTED_FALLBACK_STRATEGIES:
+        return val
+    return FALLBACK_STRATEGY_STRICT_SEQUENTIAL
+
+
 @dataclass
 class PooledCredential:
     provider: str
@@ -1602,6 +1629,20 @@ class CredentialPool:
             return current
         available = self._available_entries()
         return available[0] if available else None
+
+    def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
+        """Return the earliest per-model rate-limit TTL across all entries.
+
+        Returns a ``time.monotonic()`` timestamp, or None if no entry is
+        rate-limited for *model_id*.
+        """
+        now = time.monotonic()
+        min_ttl: Optional[float] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
+        return min_ttl
 
     def mark_rate_limited(
         self,

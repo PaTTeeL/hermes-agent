@@ -4736,7 +4736,7 @@ class AIAgent:
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
-    def _restore_primary_runtime(self) -> bool:
+    def _restore_primary_runtime(self) -> tuple[bool, Optional[float]]:
         """Forwarder — see ``agent.agent_runtime_helpers.restore_primary_runtime``."""
         from agent.agent_runtime_helpers import restore_primary_runtime
         return restore_primary_runtime(self)
