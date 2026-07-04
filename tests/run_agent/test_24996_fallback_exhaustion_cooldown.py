@@ -217,7 +217,7 @@ class TestRateLimitBackoffEscalation:
         # Cooldown expired; the primary restores successfully.
         agent._fallback_activated = True
         agent._rate_limited_until = 0
-        assert agent._restore_primary_runtime() is True
+        assert agent._restore_primary_runtime()[0] is True
         assert agent._rate_limit_backoff_count == 0
 
         # The next rate-limit is treated as a fresh first failure: 60s.

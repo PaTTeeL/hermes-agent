@@ -102,9 +102,10 @@ class TestFallbackReasoningOverride:
         agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
         agent._create_openai_client = MagicMock(return_value=MagicMock())
         agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._credential_pool = None
 
         result = restore_primary_runtime(agent)
-        assert result is True
+        assert result[0] is True
         # reasoning_config should be restored to primary's value (medium)
         assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
         assert agent.runtime_capabilities == {"native_compaction": True}

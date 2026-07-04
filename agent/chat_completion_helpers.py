@@ -1855,6 +1855,19 @@ def _rebind_fallback_credential_pool(agent, fb_provider: str, fb_model: str) -> 
             if fallback_pool and fallback_pool.has_credentials():
                 agent._credential_pool = fallback_pool
                 logger.info("Fallback to %s/%s: attached fallback credential pool", fb_provider, fb_model)
+                # Record the fallback model's per-model TTL so the sleep path can
+                # pass F1/Fm to _do_chain_exhausted_sleep.
+                _rtl_fn = getattr(fallback_pool, "rate_limit_min_ttl", None)
+                if _rtl_fn is not None:
+                    try:
+                        _fb_t = _rtl_fn(fb_model)
+                        if _fb_t is not None:
+                            if getattr(agent, "_fallback_first_ttl", None) is None:
+                                agent._fallback_first_ttl = _fb_t
+                            _cur_min = getattr(agent, "_fallback_min_ttl", None)
+                            agent._fallback_min_ttl = min(_cur_min, _fb_t) if _cur_min is not None else _fb_t
+                    except Exception:
+                        pass
         except Exception as exc:
             logger.debug("Fallback to %s/%s: could not attach credential pool: %s", fb_provider, fb_model, exc)
 
@@ -1900,8 +1913,14 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
-        logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
+        logger.warning(
+            "Fallback skip: %s/%s is not locally usable (%s); suppressing for this session",
+            fb_provider,
+            fb_model,
+            local_skip_reason,
+        )
         return True
+
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
     # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.

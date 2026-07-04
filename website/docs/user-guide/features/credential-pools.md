@@ -141,8 +141,9 @@ The pool handles different errors differently:
 | Error | Behavior | Cooldown |
 |-------|----------|----------|
 | **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 marks a **per-model** rate limit on that key (other models unaffected) and rotates to next key | 5 min → 10 min → 15 min → 1 hour (TTL escalation, capped) |
-| **402 Billing/Quota** | Immediately rotate to next key | 1 hour |
-| **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | 5 minutes |
+| **402 Billing/Quota** | Immediately rotate to next key | 24 hours |
+| **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | — |
+| **All keys rate-limited** | All pool entries per-model rate-limited → sleep until earliest TTL expires → restore primary model | — |
 | **All keys exhausted** | Fall through to `fallback_model` if configured | — |
 
 Provider-supplied `reset_at` timestamps override these default cooldowns.

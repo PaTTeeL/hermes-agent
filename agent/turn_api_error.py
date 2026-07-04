@@ -340,6 +340,18 @@ def settle_unrecovered_error(
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
             retry_count = compression_attempts = 0
             return _verdict("break")
+        # Chain exhausted: sleep until the earliest per-model 429 TTL expires
+        # (self-healing) before surfacing the terminal result.
+        if classified.reason == FailoverReason.rate_limit:
+            from agent.conversation_loop import _do_chain_exhausted_sleep
+            from agent.credential_pool import get_fallback_strategy
+            _pool = getattr(agent, "_credential_pool", None)
+            _primary_min_ttl = _pool.rate_limit_min_ttl(_model) if _pool is not None else None
+            _do_chain_exhausted_sleep(
+                agent, get_fallback_strategy(), _primary_min_ttl,
+                getattr(agent, "_fallback_first_ttl", None),
+                getattr(agent, "_fallback_min_ttl", None),
+            )
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, max_retries=max_retries, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,

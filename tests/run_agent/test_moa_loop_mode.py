@@ -133,7 +133,7 @@ moa:
     setattr(agent, "_client_kwargs", {"api_key": "fallback-key", "base_url": agent.base_url})
     agent.client = SimpleNamespace(close=lambda: None, _client=SimpleNamespace(is_closed=True))
 
-    assert agent._restore_primary_runtime() is True
+    assert agent._restore_primary_runtime()[0] is True
     assert getattr(agent, "provider") == "moa"
     assert getattr(agent, "model") == "review"
     assert agent.client is not primary_client
@@ -189,7 +189,7 @@ moa:
     agent.api_key = "fallback-key"
     setattr(agent, "_client_kwargs", {"api_key": "fallback-key", "base_url": agent.base_url})
     agent.client = SimpleNamespace(close=lambda: None, _client=SimpleNamespace(is_closed=True))
-    assert agent._restore_primary_runtime() is True
+    assert agent._restore_primary_runtime()[0] is True
 
     # The relay reads tool_progress_callback at emit time — attach a recorder
     # and fire the facade's internal _emit exactly as the fan-out does.

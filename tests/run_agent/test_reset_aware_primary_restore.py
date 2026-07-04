@@ -243,7 +243,7 @@ class TestResetAwareRestoreGate:
         # serve until an hour from now.
         agent._credential_pool = _FakePool("custom", next_at=time.time() + 3600)
 
-        assert agent._restore_primary_runtime() is False
+        assert agent._restore_primary_runtime()[0] is False
         assert agent._fallback_activated is True
         assert agent.provider == "openrouter"
         assert agent.model == "anthropic/claude-sonnet-4"
@@ -257,7 +257,7 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("custom", next_at=None)
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == "custom"
@@ -270,7 +270,7 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("custom", next_at=time.time() - 5)
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
         assert agent._fallback_activated is False
 
     def test_fails_open_on_pool_error(self):
@@ -282,7 +282,7 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("custom", raise_on_next=True)
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
         assert agent._fallback_activated is False
 
     def test_cross_provider_fallback_loads_primary_pool(self):
@@ -297,7 +297,7 @@ class TestResetAwareRestoreGate:
         primary_pool = _FakePool("custom", next_at=time.time() + 3600)
 
         with patch("agent.credential_pool.load_pool", return_value=primary_pool) as lp:
-            assert agent._restore_primary_runtime() is False
+            assert agent._restore_primary_runtime()[0] is False
         assert any(c.args == ("custom",) for c in lp.call_args_list)
         assert primary_pool.next_available_calls == 1
         assert agent._fallback_activated is True
@@ -311,7 +311,7 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("custom", next_at=None)
 
         with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
-            assert agent._restore_primary_runtime() is True
+            assert agent._restore_primary_runtime()[0] is True
 
     def test_logs_wait_only_once(self, caplog):
         import logging
@@ -322,8 +322,8 @@ class TestResetAwareRestoreGate:
         agent._credential_pool = _FakePool("custom", next_at=time.time() + 3600)
 
         with caplog.at_level(logging.INFO, logger="agent.agent_runtime_helpers"):
-            assert agent._restore_primary_runtime() is False
-            assert agent._restore_primary_runtime() is False
+            assert agent._restore_primary_runtime()[0] is False
+            assert agent._restore_primary_runtime()[0] is False
         waits = [r for r in caplog.records if "staying on fallback" in r.getMessage()]
         assert len(waits) == 1
 
@@ -335,6 +335,6 @@ class TestResetAwareRestoreGate:
         pool = _FakePool("custom", next_at=None)
         agent._credential_pool = pool
 
-        assert agent._restore_primary_runtime() is False
+        assert agent._restore_primary_runtime()[0] is False
         # Reset-aware gate never consulted — short-circuited by the 60s gate.
         assert pool.next_available_calls == 0

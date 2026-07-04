@@ -119,8 +119,9 @@ class TestSwitchModelReasoningOverride:
         agent._anthropic_prompt_cache_policy = MagicMock(return_value=(True, False))
         agent._create_openai_client = MagicMock(return_value=MagicMock())
         agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent._credential_pool = None
 
         result = restore_primary_runtime(agent)
-        assert result is True
+        assert result[0] is True
         assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
 

@@ -125,7 +125,7 @@ class TestRestorePrimaryPoolReselect:
         agent = self._make_agent(pool)
         result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         # entry-1 is exhausted, so pool should select entry-2
         assert agent.api_key == "key-2"
         assert agent._client_kwargs["api_key"] == "key-2"
@@ -142,7 +142,7 @@ class TestRestorePrimaryPoolReselect:
         agent = self._make_agent(pool)
         result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         # _swap_credential rebuilds the live OpenAI client with the fresh key.
         agent._replace_primary_openai_client.assert_called_once_with(
             reason="credential_rotation",
@@ -162,6 +162,6 @@ class TestRestorePrimaryPoolReselect:
         agent = self._make_agent(pool)
         result = agent._restore_primary_runtime()
 
-        assert result is True
+        assert result[0] is True
         assert "custom-endpoint.example.com" in agent.base_url
         assert "custom-endpoint.example.com" in agent._client_kwargs["base_url"]
