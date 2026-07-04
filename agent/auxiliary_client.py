@@ -3656,7 +3656,18 @@ def _try_main_fallback_chain(
 
     failed_norm = (failed_provider or "").strip().lower()
     main_norm = (_read_main_provider() or "").strip().lower()
-    skip = {p for p in (failed_norm, main_norm, "auto") if p}
+    main_model_norm = (_read_main_model() or "").strip().lower()
+    # Skip only fallback entries whose (provider, model) pair is identical
+    # to the main provider+model — not every entry sharing the same provider.
+    # When the main model is z-ai/glm-5.2 on nvidia_nim, fallback entries
+    # for different models (e.g. minimaxai/minimax-m3) on the same provider
+    # are legitimate alternatives and should NOT be skipped.
+    skip_pairs = {
+        (failed_norm, main_model_norm),
+        (main_norm, main_model_norm),
+    }
+    if main_model_norm:
+        skip_pairs.add(("auto", main_model_norm))
     tried: List[str] = []
     min_ctx = _task_minimum_context_length(task)
 
@@ -3669,7 +3680,7 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
-        if fb_norm in skip:
+        if (fb_norm, fb_model.lower()) in skip_pairs:
             tried.append(f"{label} (skipped)")
             continue
         if _is_provider_unhealthy(fb_norm):
@@ -4312,10 +4323,25 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = custom_entry.get("base_url", "").strip()
-            custom_key = custom_entry.get("api_key", "").strip()
-            custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
-            if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+            # Prefer credential pool over os.getenv — the pool tracks state
+            # (exhaustion, rate-limits) while os.getenv is stateless.
+            custom_key = ""
+            _pool_key = None
+            if custom_base:
+                from agent.credential_pool import get_custom_provider_pool_key
+                _pool_key = get_custom_provider_pool_key(
+                    custom_base, provider_name=custom_entry.get("name")
+                )
+            if _pool_key:
+                _pool_ok, _entry = _select_pool_entry(_pool_key)
+                if _pool_ok and _entry:
+                    custom_key = _pool_runtime_api_key(_entry) or ""
+            if not custom_key:
+                # Fall back to config/static key then env var
+                custom_key = custom_entry.get("api_key", "").strip()
+                custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
+                if not custom_key and custom_key_env:
+                    custom_key = os.getenv(custom_key_env, "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
