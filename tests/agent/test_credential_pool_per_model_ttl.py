@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import patch
+from dataclasses import replace
 
 from agent.credential_pool import CredentialPool, PooledCredential, RateLimitEntry
 
@@ -101,6 +102,39 @@ class TestPerModelRateLimitTTL:
         assert len(available) == 1
         assert available[0].id == entry.id
         assert "gpt-4" not in available[0].rate_limited
+
+    @patch("agent.credential_pool.read_credential_pool")
+    @patch("agent.credential_pool.time.time")
+    def test_consecutive_accumulates_when_disk_has_record(self, mock_time, mock_read, pool_with_entry):
+        """Consecutive 429s with an on-disk record (no 200 in between) increment consecutive."""
+        pool, entry = pool_with_entry
+        mock_time.return_value = WALL_NOW
+
+        # memory consecutive=1
+        entry_with_rl = replace(entry, rate_limited={"gpt-4": RateLimitEntry(WALL_NOW, 1)})
+        # disk consecutive=1, this process pushed first (snapshot matches)
+        mock_read.return_value = [
+            {"id": entry.id, "rate_limited": {"gpt-4": {"reset_at": WALL_NOW, "consecutive_count": 1}}}
+        ]
+        pool._c_local_last_seen["gpt-4"] = (1, WALL_NOW)
+
+        updated = pool.mark_rate_limited(entry_with_rl, "gpt-4", 429)
+        assert updated.rate_limited["gpt-4"].consecutive_count == 2
+
+    @patch("agent.credential_pool.read_credential_pool")
+    @patch("agent.credential_pool.time.time")
+    def test_mark_resets_when_disk_cleared(self, mock_time, mock_read, pool_with_entry):
+        """After a 200 clears the on-disk record, a stale-memory session restarts from 1 on the next 429."""
+        pool, entry = pool_with_entry
+        mock_time.return_value = WALL_NOW
+
+        # stale memory consecutive
+        stale = replace(entry, rate_limited={"gpt-4": RateLimitEntry(WALL_NOW, 5)})
+        # disk has no gpt-4 record
+        mock_read.return_value = [{"id": entry.id, "rate_limited": {}}]
+
+        updated = pool.mark_rate_limited(stale, "gpt-4", 429)
+        assert updated.rate_limited["gpt-4"].consecutive_count == 1
 
 
 class TestFromDictRateLimitedRobustness:

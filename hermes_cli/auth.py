@@ -887,15 +887,98 @@ def _merge_disk_cooldown_state(
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
-    ``write_credential_pool`` persists an in-memory snapshot that may predate another process
-    marking the same credential exhausted/dead; without this merge the later rewrite resurrects a
-    rate-limited key as healthy and both processes resume hammering it."""
+    ``write_credential_pool`` callers persist an in-memory snapshot that may
+    predate another process marking the same credential exhausted or dead
+    (last-writer-wins lost update).  Without this merge, process B's later
+    rewrite resurrects a rate-limited key as healthy and both processes
+    resume hammering it.  Adopt the on-disk status fields only when they are
+    strictly more recent (by ``last_status_at``) AND still binding — a DEAD
+    marker, or an EXHAUSTED cooldown that has not yet expired.  Expired
+    cooldowns are not resurrected, so the pool's own expiry-clear (which
+    resets ``last_status_at`` to None) is never overridden.
+
+    Merge the ``rate_limited`` field (per model) before the status merge, and
+    independent of the ``disk_status`` condition.  ``RateLimitEntry`` stores only
+    ``reset_at`` and ``consecutive_count``; reset_at (wall-clock time.time() + ttl)
+    is the "more recent wins" proxy.  Rules:
+
+      * memory cleared but disk has one → keep disk;
+      * memory has one but disk does not → keep memory;
+      * both present → the more-recent reset_at wins, consecutive_count takes max;
+      * expired (reset_at <= now) are dropped.
+    """
     if not isinstance(disk_entry, dict):
         return entry
     try:
         from agent.credential_pool import (
             PooledCredential, STATUS_DEAD, STATUS_EXHAUSTED, _exhausted_until, _parse_absolute_timestamp,
         )
+
+        # Merge rate_limited first.
+        now = time.time()
+        mem_rl = entry.get("rate_limited")
+        disk_rl = disk_entry.get("rate_limited")
+        _rl_changed = False
+        merged_rl: Dict[str, Any] = {}
+        if isinstance(mem_rl, dict):
+            # Memory records: drop expired, keep the rest.
+            for _m, _v in mem_rl.items():
+                if not isinstance(_v, dict):
+                    continue
+                _ra = _v.get("reset_at")
+                try:
+                    _ra_f = float(_ra) if _ra is not None else None
+                except (TypeError, ValueError):
+                    _ra_f = None
+                if _ra_f is not None and _ra_f <= now:
+                    continue  # expired, drop
+                merged_rl[_m] = _v
+            _rl_changed = True
+        if isinstance(disk_rl, dict):
+            for _m, _dv in disk_rl.items():
+                if not isinstance(_dv, dict):
+                    continue
+                _dra = _dv.get("reset_at")
+                try:
+                    _dra_f = float(_dra) if _dra is not None else None
+                except (TypeError, ValueError):
+                    _dra_f = None
+                if _dra_f is None or _dra_f <= now:
+                    continue  # expired/invalid, don't resurrect
+                _mv = merged_rl.get(_m)
+                if _mv is None:
+                    # memory has none, disk has one → keep disk
+                    merged_rl[_m] = _dv
+                    _rl_changed = True
+                else:
+                    # Both present → keep the more-recent reset_at and the max consecutive_count.
+                    _mra = _mv.get("reset_at")
+                    try:
+                        _mra_f = float(_mra) if _mra is not None else None
+                    except (TypeError, ValueError):
+                        _mra_f = None
+                    # Take the more-recent reset_at (None treated as earlier).
+                    _chosen_ra = _dra_f
+                    if _mra_f is not None and _mra_f > (_dra_f or 0.0):
+                        _chosen_ra = _mra_f
+                    # consecutive_count takes the max.
+                    try:
+                        _mcc = int(_mv.get("consecutive_count") or 0)
+                    except (TypeError, ValueError):
+                        _mcc = 0
+                    try:
+                        _dcc = int(_dv.get("consecutive_count") or 0)
+                    except (TypeError, ValueError):
+                        _dcc = 0
+                    _chosen_cc = max(_mcc, _dcc)
+                    merged_rl[_m] = {
+                        "reset_at": _chosen_ra,
+                        "consecutive_count": _chosen_cc,
+                    }
+                    _rl_changed = True
+        if _rl_changed:
+            entry = dict(entry)
+            entry["rate_limited"] = merged_rl
 
         disk_status = disk_entry.get("last_status")
         if disk_status not in (STATUS_DEAD, STATUS_EXHAUSTED):

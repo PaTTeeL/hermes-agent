@@ -996,6 +996,8 @@ class CredentialPool:
         # entries" and the caller's 401 retry loop runs unbounded. Reset when a
         # real entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        # Per model_id, the last (consecutive, reset_at) this process saw, for dedupe.
+        self._c_local_last_seen: Dict[str, Tuple[int, float]] = {}
 
     # ---- read accessors ---------------------------------------------------
 
@@ -2105,27 +2107,104 @@ class CredentialPool:
         model_id: str,
         status_code: int,
         error_context: Optional[Dict[str, Any]] = None,
+        *,
+        persist: bool = True,
     ) -> PooledCredential:
-        """Mark per-model rate limit (429 only). Does NOT set STATUS_EXHAUSTED.
-        TTL escalates on consecutive 429s (configurable via credential_pool_strategies).
-        reset_at stored as wall clock — see RateLimitEntry."""
+        """Mark a per-model rate limit (429 only). Does NOT set STATUS_EXHAUSTED.
+
+        Every 429 increments consecutive by 1; TTL = first + step * (consecutive - 1),
+        capped at max.  The unlocked core below avoids the non-reentrant
+        threading.Lock deadlock.
+        """
+        with self._lock:
+            return self._mark_rate_limited_unlocked(
+                entry,
+                model_id,
+                status_code,
+                error_context=error_context,
+                persist=persist,
+            )
+
+    def _mark_rate_limited_unlocked(
+        self,
+        entry: PooledCredential,
+        model_id: str,
+        status_code: int,
+        error_context: Optional[Dict[str, Any]] = None,
+        *,
+        persist: bool = True,
+    ) -> PooledCredential:
+        """Unlocked core of mark_rate_limited (for mark_exhausted_and_rotate, which
+        already holds self._lock).
+
+        Every 429 increments consecutive by 1.  reset_at is wall clock — see
+        RateLimitEntry.
+
+        Dedupe: before writing we read the on-disk rate_limited[model_id] to get
+        (c_disk, rat_disk).  If it matches _c_local_last_seen[model_id] no one else
+        has pushed since our last write → we pushed first → +1.  If it differs
+        (another process just pushed) we don't double-increment: adopt the disk
+        state (c_new = c_disk) and return.  Then _persist →
+        _merge_disk_cooldown_state does a max(memory, disk) merge under flock so
+        concurrent +1s don't lose count.
+        """
         now = time.time()
         existing = entry.rate_limited.get(model_id)
-        # Unconditional increment: every 429 advances consecutive regardless of
-        # TTL window.  Reset (back to 1) happens explicitly via clear_rate_limit()
-        # on a successful 200, not by any time-window heuristic.
-        consecutive = (existing.consecutive_count + 1) if existing else 1
+        # Every 429 increments consecutive; a successful 200 resets it back to 1
+        # via clear_rate_limit().
+        c_mem_base = (existing.consecutive_count + 1) if existing else 1
+        # Against the on-disk (consecutive, reset_at): match → +1; differ → adopt disk;
+        # missing → restart from 1.
+        c_new = c_mem_base
+        _rat_disk = None
+        try:
+            _disk_entries = read_credential_pool(self.provider)
+        except Exception:
+            _disk_entries = None
+        if isinstance(_disk_entries, list):
+            _disk_e = next(
+                (d for d in _disk_entries if isinstance(d, dict) and d.get("id") == entry.id),
+                None,
+            )
+            if isinstance(_disk_e, dict):
+                _disk_rl = _disk_e.get("rate_limited")
+                if isinstance(_disk_rl, dict):
+                    _dv = _disk_rl.get(model_id)
+                    if isinstance(_dv, dict):
+                        _c_disk = 0
+                        try:
+                            _c_disk = int(_dv.get("consecutive_count") or 0)
+                        except (TypeError, ValueError):
+                            _c_disk = 0
+                        _rat_disk = _dv.get("reset_at")
+                        _last = self._c_local_last_seen.get(model_id)
+                        if _last is not None and _last == (_c_disk, _rat_disk):
+                            # We pushed first → +1.
+                            pass
+                        else:
+                            # Someone else pushed → adopt their disk count.
+                            c_new = _c_disk
+                    else:
+                        # No on-disk record → restart from 1.
+                        c_new = 1
+                else:
+                    # Entry has no rate_limited field → restart from 1.
+                    c_new = 1
         config = _load_config_safe() or {}
         strategies = config.get("credential_pool_strategies", {}) or {}
         first_ttl = strategies.get("rate_limit_ttl_first_seconds", RATE_LIMIT_TTL_FIRST_SECONDS)
         step_ttl = strategies.get("rate_limit_ttl_step_seconds", RATE_LIMIT_TTL_STEP_SECONDS)
         max_ttl = strategies.get("rate_limit_ttl_max_seconds", RATE_LIMIT_TTL_MAX_SECONDS)
-        ttl = min(first_ttl + step_ttl * (consecutive - 1), max_ttl)
+        # Clamp consecutive to at least 1.
+        c_new = max(c_new, 1)
+        ttl = min(first_ttl + step_ttl * (c_new - 1), max_ttl)
         reset_at = now + ttl
+        # Backfill the dedupe snapshot (consecutive, reset_at).
+        self._c_local_last_seen[model_id] = (c_new, reset_at)
         normalized_error = _normalize_error_context(error_context)
         updated = replace(
             entry,
-            rate_limited={**entry.rate_limited, model_id: RateLimitEntry(reset_at, consecutive)},
+            rate_limited={**entry.rate_limited, model_id: RateLimitEntry(reset_at, c_new)},
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
@@ -2179,7 +2258,8 @@ class CredentialPool:
             _label = entry.label or entry.id[:8]
             if status_code == 429 and model_id:
                 logger.info("credential pool: marking %s rate-limited (model=%s, status=%s), rotating", _label, model_id, status_code)
-                self.mark_rate_limited(entry, model_id, status_code, error_context)
+                # Holding the lock → unlocked core, persist=False.
+                self._mark_rate_limited_unlocked(entry, model_id, status_code, error_context, persist=False)
             else:
                 self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
             # A 402/429/401 is a key-level failure, and the same key can back
@@ -2193,7 +2273,8 @@ class CredentialPool:
                         continue
                     if sibling.runtime_api_key == failed_runtime_key:
                         if status_code == 429 and model_id:
-                            self.mark_rate_limited(sibling, model_id, status_code, error_context)
+                            # Holding the lock → unlocked core, persist=False.
+                            self._mark_rate_limited_unlocked(sibling, model_id, status_code, error_context, persist=False)
                         else:
                             self._mark_exhausted(
                                 sibling, status_code, error_context, persist=False, failure_reason=failure_reason
