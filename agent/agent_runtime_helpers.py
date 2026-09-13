@@ -535,9 +535,14 @@ def _merge_consecutive_users(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # A summary carrier followed by a new user row is a deliberate durable shape after
             # retry/rewind; never mutate the persisted carrier (sanitizers merge copies later).
             and split_user_originated_turn(prev)[0] is None
-            # A /steer row that ended the previous run is already persisted; merging the next
-            # prompt into it would rewrite it in place and re-break replay parity.
-            and prev.get("display_kind") != STEER_DISPLAY_KIND
+            # Bookkeeping rows (model_switch notices, …) carry role="user" but are not
+            # human input: they are transparent to alternation. Never merge into one as
+            # the carrier (the next prompt would be swallowed — unaddressable for /undo)
+            # and never fold one into a human row (the notice would pollute replay).
+            # This also excludes /steer rows: merging the next prompt into a steer row
+            # that already persisted would rewrite it in place and re-break replay parity.
+            and prev.get("display_kind") is None
+            and msg.get("display_kind") is None
             # Only merge plain-text content; leave multimodal (list) content alone.
             and isinstance(prev.get("content", ""), str) and isinstance(msg.get("content", ""), str)
         ):

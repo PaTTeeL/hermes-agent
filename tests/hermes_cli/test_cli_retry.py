@@ -416,3 +416,30 @@ def test_undo_last_after_adjacent_user_rows_resume(tmp_path):
     assert [m["role"] for m in remaining] == [], "first ask row must be rewound (archived)"
     cli._prefill_input_buffer.assert_called_once()
     db.close()
+
+
+def test_retry_negative_ordinal_after_adjacent_user_rows_resume(tmp_path):
+    """Invariant: /retry passes user_ordinal=-1 ("last user turn"). After resume
+    merges the adjacent durable rows, the durable-side normalization lands past
+    the merged warm tail — the ordinal must re-normalize against the warm view
+    instead of raising 'session history changed' / target-unavailable."""
+    cli = _make_cli()
+    cli._session_db.close()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db = db
+    cli.session_id = "cli-adjacent-user-retry"
+    db.create_session(cli.session_id, source="cli")
+    db.append_message(cli.session_id, "user", "first ask")
+    db.append_message(cli.session_id, "user", "second ask")
+    db.append_message(cli.session_id, "assistant", "answer")
+    model_history, _display = db.get_resume_conversations(cli.session_id)
+    model_history = [m for m in model_history if m.get("role") != "session_meta"]
+
+    outcome = db.rewind_user_turn(
+        cli.session_id, -1, warm_history=model_history, require_retryable=True,
+    )
+
+    assert outcome is not None
+    remaining = db.get_messages_as_conversation(cli.session_id, include_row_ids=True)
+    assert [m["role"] for m in remaining] == [], "retry rewinds the last (merged) turn"
+    db.close()

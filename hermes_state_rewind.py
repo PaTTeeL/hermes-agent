@@ -67,6 +67,7 @@ class SessionRewindMixin:
         expected_active_ids = self.get_active_message_ids(session_id)
         durable = self.get_messages_as_conversation(session_id, include_row_ids=True)
         durable_user = _user_indices(durable)
+        original_ordinal = user_ordinal
         if user_ordinal < 0:
             user_ordinal = max(len(durable_user) + user_ordinal, 0)
         if user_ordinal >= len(durable_user):
@@ -90,9 +91,16 @@ class SessionRewindMixin:
             # /undo semantics deletes from), falling back to positional indexing only
             # when the shapes agree. The in-transaction expected_target_content pin
             # below still guards the actual rewrite.
-            if user_ordinal < 0 or user_ordinal >= len(warm_user):
+            warm_ordinal = user_ordinal
+            if original_ordinal < 0:
+                # Negative ordinals address the tail of the view the caller sees
+                # (/retry passes -1 for "the last user turn"). The durable-side
+                # normalization above can land past the merged warm tail, so
+                # re-normalize against the warm view itself.
+                warm_ordinal = max(len(warm_user) + original_ordinal, 0)
+            if warm_ordinal < 0 or warm_ordinal >= len(warm_user):
                 raise RewindTargetUnavailableError("target user message is no longer in session history")
-            _, warm_live_target = history_before_user_originated_turn(warm, warm_user[user_ordinal])
+            _, warm_live_target = history_before_user_originated_turn(warm, warm_user[warm_ordinal])
             warm_cmp = _comparison_content(warm_live_target)
             warm_variants = [warm_cmp]
             if isinstance(warm_cmp, str):
@@ -116,7 +124,7 @@ class SessionRewindMixin:
                 target = durable[target_index]
                 durable_prefix, live_view = history_before_user_originated_turn(durable, target_index)
                 scaffold, _ = split_user_originated_turn(target)
-            prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[user_ordinal])
+            prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[warm_ordinal])
             if not merged_anchor and _comparison_content(live_view) != _comparison_content(warm_live_view):
                 raise RuntimeError(_HISTORY_CHANGED)
         # Retry re-sends the stored bytes: ``"".join`` of the text parts, never the "\n"-joined display

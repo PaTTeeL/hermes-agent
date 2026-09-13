@@ -69,6 +69,29 @@ def test_repair_preserves_user_content_when_one_side_empty():
     assert messages == [{"role": "user", "content": "real message"}]
 
 
+def test_repair_never_merges_user_prompt_into_bookkeeping_row():
+    """A bookkeeping row (model_switch notice) carries role="user" but has no
+    user-originated view. Merging the next human prompt into it would swallow
+    that turn — it stops being addressable for /undo and pollutes the notice
+    on model replay. The merge carrier must be a human-authored row."""
+    from agent.context_compressor import user_originated_turn_view
+
+    agent = _bare_agent()
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "[System: model switched to X]", "display_kind": "model_switch"},
+        {"role": "user", "content": "second"},
+    ]
+
+    AIAgent._repair_message_sequence(agent, messages)
+
+    contents = [m.get("content") for m in messages]
+    assert "second" in contents, "human prompt must stay an addressable row"
+    notice = next(m for m in messages if m.get("display_kind") == "model_switch")
+    assert notice["content"] == "[System: model switched to X]", "notice must stay unpolluted"
+    assert user_originated_turn_view(next(m for m in messages if m["content"] == "second")) is not None
+
+
 def test_repair_does_not_rewind_ongoing_dialog_tool_pair():
     """assistant(tool_calls) + tool + user is a VALID pattern (user redirect
     before the model gets its continuation turn). Repair must not touch it —
