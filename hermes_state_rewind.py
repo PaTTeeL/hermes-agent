@@ -70,6 +70,7 @@ class SessionRewindMixin:
         # (#115493); the merged turn keeps the first row's identity, so the rewind starts at that row.
         durable = self.get_messages_as_conversation(session_id, include_row_ids=True, repair_alternation=True)
         durable_user = _user_indices(durable)
+        original_ordinal = user_ordinal
         if user_ordinal < 0:
             user_ordinal = max(len(durable_user) + user_ordinal, 0)
         if user_ordinal >= len(durable_user):
@@ -85,10 +86,72 @@ class SessionRewindMixin:
         if warm_history is not None:
             warm = [m for m in warm_history if not _is_ephemeral_scaffolding(m)]
             warm_user = _user_indices(warm)
-            if len(warm_user) != len(durable_user):
-                raise RuntimeError(_HISTORY_CHANGED)
-            prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[user_ordinal])
-            if _comparison_content(live_view) != _comparison_content(warm_live_view):
+            # Anchor by durable row identity first (resume loads warm rows with
+            # include_row_ids=True; append_message stamps ``_row_id``), falling back to
+            # content match when the warm target carries no id: resume's alternation repair
+            # (repair_alternation=True) merges adjacent durable user rows into one warm
+            # row, so warm and durable legitimately disagree on how many user turns
+            # exist. Resolve the durable anchor row from the warm target text
+            # (full joined text first, then the merged row's first segment — the row
+            # /undo semantics deletes from), falling back to positional indexing only
+            # when the shapes agree. The in-transaction expected_target_content pin
+            # below still guards the actual rewrite.
+            warm_ordinal = user_ordinal
+            if original_ordinal < 0:
+                # Negative ordinals address the tail of the view the caller sees
+                # (/retry passes -1 for "the last user turn"). The durable-side
+                # normalization above can land past the merged warm tail, so
+                # re-normalize against the warm view itself.
+                warm_ordinal = max(len(warm_user) + original_ordinal, 0)
+            if warm_ordinal < 0 or warm_ordinal >= len(warm_user):
+                raise RewindTargetUnavailableError("target user message is no longer in session history")
+            _, warm_live_target = history_before_user_originated_turn(warm, warm_user[warm_ordinal])
+            warm_cmp = _comparison_content(warm_live_target)
+            # Merged warm row: its first segment is the earliest durable user row
+            # that got folded into it. This maps to the durable row that /undo
+            # semantics actually deletes from.
+            warm_first_segment = warm_cmp.split("\n\n", 1)[0] if isinstance(warm_cmp, str) else None
+            merged_anchor = False
+            anchor_index = None
+            warm_target_id = warm_live_target.get("_row_id")
+            if isinstance(warm_target_id, int):
+                # Identity anchor: distinct separate turns keep distinct row ids, so
+                # the requested turn resolves to its own row even when an earlier
+                # turn carries identical text (mis-anchoring there used to archive
+                # every row from the EARLIEST duplicate onward — silent data loss).
+                # A resume-merged warm row folds several durable rows into one and
+                # keeps the FIRST folded row's id (the merge mutates ``prev`` in
+                # place), so undo deletes from that earliest absorbed row — matching
+                # the merged /undo semantics.  ``anchor_index`` is the row's index
+                # into the ``durable`` list (the same coordinate ``target_index``
+                # uses), NOT a user ordinal.
+                anchor_index = next(
+                    (i for i in durable_user if durable[i].get("_row_id") == warm_target_id), None)
+                if anchor_index is not None:
+                    anchored_cmp = _comparison_content(durable[anchor_index])
+                    merged_anchor = anchored_cmp != warm_cmp
+            if anchor_index is None:
+                # Content fallback (rows without ids) / positional fallback.
+                warm_variants = [warm_cmp]
+                if warm_first_segment is not None and warm_first_segment != warm_cmp:
+                    warm_variants.append(warm_first_segment)
+                for _di in durable_user:
+                    if _comparison_content(durable[_di]) in warm_variants:
+                        anchor_index = _di
+                        merged_anchor = _comparison_content(durable[_di]) != warm_cmp
+                        break
+                if anchor_index is None:
+                    if len(durable_user) == len(warm_user):
+                        anchor_index = durable_user[user_ordinal]
+                    else:
+                        raise RuntimeError(_HISTORY_CHANGED)
+            if anchor_index != target_index:
+                target_index = anchor_index
+                target = durable[target_index]
+                durable_prefix, live_view = history_before_user_originated_turn(durable, target_index)
+                scaffold, _ = split_user_originated_turn(target)
+            prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[warm_ordinal])
+            if not merged_anchor and _comparison_content(live_view) != _comparison_content(warm_live_view):
                 raise RuntimeError(_HISTORY_CHANGED)
         # Retry re-sends the stored bytes: ``"".join`` of the text parts, never the "\n"-joined display
         # flattening (wire bytes == stored bytes; ``"ab"`` must not come back as ``"a\nb"``).
