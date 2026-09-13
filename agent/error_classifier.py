@@ -1043,6 +1043,14 @@ def _status_404(c: _Ctx) -> Verdict:
 
 
 def _status_429(c: _Ctx) -> Verdict:
+    # ModelScope/百炼 reuses OpenAI's ``insufficient_quota`` 429 for the free tier's
+    # DAILY token quota, which resets daily — a periodic wall, not billing. Provider-
+    # scoped on purpose: for OpenAI the same code IS credit exhaustion. (errors.log
+    # real body: code=insufficient_quota, help.aliyun.com/zh/model-studio/error-code#token-limit)
+    # Must precede the billing-code check below: ``insufficient_quota`` IS a
+    # billing code, so the decisive-billing branch would otherwise swallow it.
+    if "modelscope" in c.provider_slug and c.code == "insufficient_quota":
+        return _V_RATE_LIMIT
     # A structured billing code is decisive: LiteLLM stamps
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
     # this handler always returns, so _by_error_code never sees the code.

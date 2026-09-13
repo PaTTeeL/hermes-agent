@@ -394,6 +394,37 @@ class TestClassifyApiError:
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("provider", ["modelscope", "custom:modelscope", "MODELSCOPE"])
+    def test_429_modelscope_insufficient_quota_is_rate_limit(self, provider):
+        # ModelScope/百炼 reuses OpenAI's ``insufficient_quota`` 429 for the free
+        # tier's DAILY token quota (resets daily), so it must stay a retryable
+        # rate limit, not abort the conversation as billing. (real body from
+        # errors.log: code=insufficient_quota, help.aliyun.com .../#token-limit)
+        e = MockAPIError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            status_code=429,
+            body={"error": {"code": "insufficient_quota", "type": "insufficient_quota",
+                            "message": "You exceeded your current quota."}},
+        )
+        result = classify_api_error(e, provider=provider, model="deepseek-ai/DeepSeek-V4-Flash-0731")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_429_openai_insufficient_quota_stays_billing(self):
+        # Guard: the ModelScope carve-out is provider-scoped — for OpenAI the
+        # same ``insufficient_quota`` code IS credit exhaustion.
+        e = MockAPIError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            status_code=429,
+            body={"error": {"code": "insufficient_quota", "type": "insufficient_quota",
+                            "message": "You exceeded your current quota."}},
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-5")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
     def test_429_rate_limit_phrase_never_promotes_to_billing(self):
         # The exclusion guard: "Rate limit exceeded" contains the
         # "limit exceeded" usage-limit substring, but an explicit rate-limit
