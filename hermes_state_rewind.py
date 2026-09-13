@@ -82,10 +82,42 @@ class SessionRewindMixin:
         if warm_history is not None:
             warm = [m for m in warm_history if not _is_ephemeral_scaffolding(m)]
             warm_user = _user_indices(warm)
-            if len(warm_user) != len(durable_user):
-                raise RuntimeError(_HISTORY_CHANGED)
+            # Anchor by content, not by count: resume's alternation repair
+            # (repair_alternation=True) merges adjacent durable user rows into one warm
+            # row, so warm and durable legitimately disagree on how many user turns
+            # exist. Resolve the durable anchor row from the warm target text
+            # (full joined text first, then the merged row's first segment — the row
+            # /undo semantics deletes from), falling back to positional indexing only
+            # when the shapes agree. The in-transaction expected_target_content pin
+            # below still guards the actual rewrite.
+            if user_ordinal < 0 or user_ordinal >= len(warm_user):
+                raise RewindTargetUnavailableError("target user message is no longer in session history")
+            _, warm_live_target = history_before_user_originated_turn(warm, warm_user[user_ordinal])
+            warm_cmp = _comparison_content(warm_live_target)
+            warm_variants = [warm_cmp]
+            if isinstance(warm_cmp, str):
+                first_segment = warm_cmp.split("\n\n", 1)[0]
+                if first_segment != warm_cmp:
+                    warm_variants.append(first_segment)
+            merged_anchor = False
+            anchor_ordinal = None
+            for _di in durable_user:
+                if _comparison_content(durable[_di]) in warm_variants:
+                    anchor_ordinal = durable_user.index(_di)
+                    merged_anchor = _comparison_content(durable[_di]) != warm_cmp
+                    break
+            if anchor_ordinal is None:
+                if len(durable_user) == len(warm_user):
+                    anchor_ordinal = user_ordinal
+                else:
+                    raise RuntimeError(_HISTORY_CHANGED)
+            if anchor_ordinal != user_ordinal:
+                target_index = durable_user[anchor_ordinal]
+                target = durable[target_index]
+                durable_prefix, live_view = history_before_user_originated_turn(durable, target_index)
+                scaffold, _ = split_user_originated_turn(target)
             prefix, warm_live_view = history_before_user_originated_turn(warm, warm_user[user_ordinal])
-            if _comparison_content(live_view) != _comparison_content(warm_live_view):
+            if not merged_anchor and _comparison_content(live_view) != _comparison_content(warm_live_view):
                 raise RuntimeError(_HISTORY_CHANGED)
         # Retry re-sends the stored bytes: ``"".join`` of the text parts, never the "\n"-joined display
         # flattening (wire bytes == stored bytes; ``"ab"`` must not come back as ``"a\nb"``).

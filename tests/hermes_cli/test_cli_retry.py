@@ -375,3 +375,44 @@ def test_undo_last_prefills_live_text_and_retains_durable_scaffold(tmp_path):
     assert cli.agent._session_messages is cli.conversation_history
     assert cli.agent._last_flushed_db_idx == 3
     db.close()
+
+
+def test_undo_last_after_adjacent_user_rows_resume(tmp_path):
+    """Invariant: adjacent durable user rows (merged into one warm row by
+    resume's alternation repair) must NOT trip the 'session history changed'
+    guard — /undo anchors the durable row by content, not by count."""
+    cli = _make_cli()
+    cli._session_db.close()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    cli._session_db = db
+    cli.session_id = "cli-adjacent-user-undo"
+    db.create_session(cli.session_id, source="cli")
+    db.append_message(cli.session_id, "user", "first ask")
+    db.append_message(cli.session_id, "user", "second ask")
+    db.append_message(cli.session_id, "assistant", "answer")
+    # Resume loads the alternation-repaired view: adjacent user rows merged.
+    from hermes_state_messages import SessionMessagesMixin  # noqa: F401  (import sanity)
+    model_history, _display = db.get_resume_conversations(cli.session_id)
+    model_history = [m for m in model_history if m.get("role") != "session_meta"]
+    merged = [m for i, m in enumerate(model_history)
+              if m["role"] == "user" and isinstance(m.get("content"), str)]
+    assert len(merged) == 1 and merged[0]["content"] == "first ask\n\nsecond ask", (
+        "precondition: resume repair merged the adjacent user rows")
+    cli.conversation_history = model_history
+    cli._prefill_input_buffer = MagicMock()
+    cli.agent = SimpleNamespace(
+        _session_messages=cli.conversation_history,
+        _last_flushed_db_idx=len(cli.conversation_history),
+        _db_flush_scan_prefix=list(cli.conversation_history),
+        _invalidate_system_prompt=MagicMock(),
+        _memory_manager=None,
+    )
+
+    cli.undo_last()
+
+    # /undo drops the merged (last) user turn: warm history rewinds before it,
+    # and the durable transcript rewinds the anchored row and everything after.
+    remaining = db.get_messages_as_conversation(cli.session_id, include_row_ids=True)
+    assert [m["role"] for m in remaining] == [], "first ask row must be rewound (archived)"
+    cli._prefill_input_buffer.assert_called_once()
+    db.close()
