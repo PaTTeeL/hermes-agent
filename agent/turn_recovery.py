@@ -1246,6 +1246,32 @@ def max_retries_exhausted_result(
     return result
 
 
+def _rate_limit_note_from_error(api_error: Exception) -> str:
+    """Name the rate-limit bucket on the always-logged warning line.
+
+    A 429 repeats for as long as the window is shut, and the retry line is the only
+    record of it (the request dump fires on terminal failures only). ``x-ratelimit-*``
+    and ``Retry-After`` are what tell "wait" apart from "switch provider", so the
+    values ride the warning line; a non-429 error yields an empty note.
+    """
+    headers = getattr(getattr(api_error, "response", None), "headers", None)
+    if not headers:
+        return ""
+    try:
+        from agent.rate_limit_tracker import has_rate_limit_headers, lower_headers
+        lowered = lower_headers(headers)
+    except Exception:
+        return ""
+    if not has_rate_limit_headers(lowered):
+        return ""
+    from agent.retry_utils import parse_retry_after_seconds
+    parts = [f"{k}={lowered[k]}" for k in sorted(lowered) if k.startswith("x-ratelimit-")]
+    retry_after = parse_retry_after_seconds(lowered)
+    if retry_after is not None:
+        parts.append(f"retry-after={retry_after:.0f}s")
+    return " ".join(parts)
+
+
 def log_api_error_attempt(
     agent: Any, api_error: Exception, *, retry_count: int, max_retries: int,
     status_code: Optional[int], elapsed_time: float, api_messages: Any, approx_tokens: int,
@@ -1262,9 +1288,11 @@ def log_api_error_attempt(
     error_msg = str(api_error).lower()
     _error_summary = agent._summarize_api_error(api_error)
     _attempt = f"attempt {retry_count}/{max_retries}" + ("" if retryable else ", not retryable")
+    _rate_limit_note = _rate_limit_note_from_error(api_error)
     logger.warning(
-        "API call failed (%s) error_type=%s %s summary=%s",
+        "API call failed (%s) error_type=%s %s summary=%s%s",
         _attempt, error_type, agent._client_log_context(), _error_summary,
+        f" | {_rate_limit_note}" if _rate_limit_note else "",
     )
 
     _provider = getattr(agent, "provider", "unknown")

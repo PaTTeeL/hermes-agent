@@ -1413,6 +1413,11 @@ def _api_error_debug_info(error: Exception) -> Dict[str, Any]:
     if response_obj is not None:
         try:
             info["response_status"] = getattr(response_obj, "status_code", None)
+            headers = getattr(response_obj, "headers", None)
+            if headers:
+                # Provider headers name the rate-limit bucket and the request id — the data
+                # that explains a 429. redact_sensitive_text covers the payload on write.
+                info["response_headers"] = dict(headers)
             info["response_text"] = response_obj.text
         except Exception as e:
             _ra().logger.debug("Could not extract error response details: %s", e)
