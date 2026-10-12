@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from agent.credential_pool import PooledCredential
 
 # A Codex ChatGPT-account model entitlement 400 is a plan property, not a window: bench the
-# (credential, model) pair until an explicit ``hermes auth reset`` clears model_cooldowns (#71970).
+# (credential, model) pair until an explicit ``hermes auth reset`` clears the blocked slot (#71970).
 MODEL_ENTITLEMENT_BENCH_SECONDS = 365 * 24 * 60 * 60
 
 
@@ -25,22 +25,49 @@ def model_cooldown_until(entry: "PooledCredential", model: Optional[str]) -> Opt
     Callers that do not know the model stay conservative: any active model
     cooldown blocks them, so an unscoped route cannot reuse the credential.
     """
-    cooldowns = entry.model_cooldowns or {}
-    values = cooldowns.values() if not model else (cooldowns.get(model),)
+    windows = entry.model_cooldowns or {}
+    values = windows.values() if not model else (windows.get(model),)
     now = time.time()
-    active = [float(until) for until in values if isinstance(until, (int, float)) and until > now]
+    active = [
+        w.blocked_until
+        for w in values
+        if w is not None and w.blocked_until is not None and w.blocked_until > now
+    ]
     return max(active) if active else None
 
 
-def merge_model_cooldowns(*maps: Any) -> Dict[str, float]:
-    """Latest reset per model across snapshots — each writer only observed its own model."""
-    merged: Dict[str, float] = {}
-    for cooldowns in maps:
-        if not isinstance(cooldowns, dict):
+def merge_model_cooldowns(*maps: Any) -> Dict[str, Any]:
+    """Merge per-model window rows across snapshots.
+
+    Each slot resolves independently: the reset slot moves as an indivisible
+    ``(reset_at, consecutive_count)`` pair so the later window keeps its own
+    ladder count, and the blocked slot keeps the later ``blocked_until`` with
+    its own reason.  Legacy value shapes (bare float benches, plain dicts)
+    normalize on the way in; malformed or empty values are dropped.
+    """
+    from agent.credential_pool import ModelWindow, _window_row
+
+    merged: Dict[str, ModelWindow] = {}
+    for snapshot in maps:
+        if not isinstance(snapshot, dict):
             continue
-        for model, until in cooldowns.items():
-            if isinstance(until, (int, float)):
-                merged[model] = max(float(until), merged.get(model, 0.0))
+        for model, raw in snapshot.items():
+            row = _window_row(raw)
+            if row is None:
+                continue
+            current = merged.get(model)
+            if current is None:
+                merged[model] = row
+                continue
+            if (row.reset_at or 0.0) > (current.reset_at or 0.0):
+                reset_at, consecutive = row.reset_at, row.consecutive_count
+            else:
+                reset_at, consecutive = current.reset_at, current.consecutive_count
+            if (row.blocked_until or 0.0) > (current.blocked_until or 0.0):
+                blocked_until, blocked_reason = row.blocked_until, row.blocked_reason
+            else:
+                blocked_until, blocked_reason = current.blocked_until, current.blocked_reason
+            merged[model] = ModelWindow(reset_at, consecutive, blocked_until, blocked_reason)
     return merged
 
 
@@ -87,18 +114,21 @@ class CredentialPoolModelCooldownMixin:
         would otherwise be re-selected for the very model that just failed.
         Caller holds the lock.
         """
-        from agent.credential_pool import _exhausted_ttl, _normalize_error_context
+        from agent.credential_pool import ModelWindow, _exhausted_ttl, _normalize_error_context
 
         if failure_reason == "model_entitlement":
             until = time.time() + MODEL_ENTITLEMENT_BENCH_SECONDS
+            reason = "entitlement"
         else:
             until = _normalize_error_context(error_context).get("reset_at") or (
                 time.time() + _exhausted_ttl(429, sole_credential=self._is_sole_credential())
             )
+            reason = "cooldown"
+        bench = ModelWindow(blocked_until=until, blocked_reason=reason)
         failed_key = entry.runtime_api_key
         for scoped in list(self._entries):
             if scoped.id != entry.id and not (failed_key and scoped.runtime_api_key == failed_key):
                 continue
-            cooldowns = merge_model_cooldowns(scoped.model_cooldowns, {model: until})
-            self._adopt(scoped, persist=False, model_cooldowns=cooldowns)
+            windows = merge_model_cooldowns(scoped.model_cooldowns, {model: bench})
+            self._adopt(scoped, persist=False, model_cooldowns=windows)
         self._persist()

@@ -12,10 +12,10 @@ import threading
 import time
 import uuid
 import re
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
@@ -49,6 +49,77 @@ from hermes_cli.auth import (
     read_credential_pool,
     write_credential_pool,
 )
+
+
+class ModelWindow(NamedTuple):
+    """One model's availability state on a credential; wall-clock epochs.
+
+    ``reset_at``/``consecutive_count`` are the open 429 observation (the first
+    429 starts the ladder; a success clears it); ``blocked_until``/
+    ``blocked_reason`` are the rotation bench / entitlement slot written when
+    the pool cycles the credential.  Both slots persist to auth.json so the
+    state survives restarts and reads identically across processes.
+    """
+    reset_at: Optional[float] = None
+    consecutive_count: int = 0
+    blocked_until: Optional[float] = None
+    blocked_reason: Optional[str] = None
+
+
+# Stored layouts that predate the unified table; migrated in ``from_dict`` and
+# excluded from ``extra`` so they can never ride back to disk.
+LEGACY_WINDOW_KEYS = ("rate_limited",)
+
+
+def _window_row(raw: Any) -> Optional["ModelWindow"]:
+    """Normalize one stored per-model value into a ``ModelWindow`` row.
+
+    Accepts the native dict form, an already-built row, and the pre-upgrade
+    bare float bench written under ``model_cooldowns``.
+    Returns ``None`` for malformed or empty values so callers drop them.
+    """
+    if isinstance(raw, ModelWindow):
+        return raw
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return ModelWindow(blocked_until=float(raw), blocked_reason="cooldown")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        reset_at = float(raw["reset_at"]) if raw.get("reset_at") is not None else None
+        consecutive = int(raw.get("consecutive_count") or 0)
+        blocked_until = float(raw["blocked_until"]) if raw.get("blocked_until") is not None else None
+    except (TypeError, ValueError):
+        return None
+    if (reset_at is not None and reset_at < 0) or consecutive < 0:
+        return None
+    reason = raw.get("blocked_reason")
+    if blocked_until is None or not isinstance(reason, str):
+        reason = None
+    elif reason not in ("cooldown", "entitlement"):
+        reason = "cooldown"
+    if reset_at is None and blocked_until is None:
+        return None
+    return ModelWindow(
+        reset_at=reset_at, consecutive_count=consecutive,
+        blocked_until=blocked_until, blocked_reason=reason,
+    )
+
+
+def _window_json(row: "ModelWindow") -> Dict[str, Any]:
+    """JSON form of one window row: a dict of its non-None slots."""
+    return {
+        key: val
+        for key, val in (
+            ("reset_at", row.reset_at),
+            ("consecutive_count", row.consecutive_count),
+            ("blocked_until", row.blocked_until),
+            ("blocked_reason", row.blocked_reason),
+        )
+        if val is not None
+    }
+
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +235,12 @@ NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 
 # Pool key prefix for custom OpenAI-compatible endpoints: all share
 # provider='custom' but are keyed 'custom:<normalized_name>'.
+
+# Default per-model 429 rate-limit TTL escalation (seconds), overridden by
+# credential_pool_strategies in config.yaml.
+RATE_LIMIT_TTL_FIRST_SECONDS  = 5 * 60       # first 429 -> 5 min
+RATE_LIMIT_TTL_STEP_SECONDS   = 5 * 60       # each consecutive -> +5 min
+RATE_LIMIT_TTL_MAX_SECONDS    = 60 * 60      # cap at 1 hour
 CUSTOM_POOL_PREFIX = "custom:"
 
 # Fields only round-tripped through JSON — never used for logic as attributes.
@@ -234,9 +311,12 @@ class PooledCredential:
     agent_key_expires_at: Optional[str] = None
     request_count: int = 0
     # A provider may rate-limit one model while the same credential remains
-    # usable for its sibling models.  Keep that observation separate from the
-    # credential-wide status used for auth and billing failures.
-    model_cooldowns: Optional[Dict[str, float]] = None
+    # usable for its sibling models.  One row per model holds both kinds of
+    # window — the open 429 observation and the rotation bench — beside the
+    # credential-wide status used for auth and billing failures.  The upstream
+    # field name is kept; the value type upgrades from a bare float bench to a
+    # ``ModelWindow`` row, and pre-upgrade floats load as the blocked slot.
+    model_cooldowns: Optional[Dict[str, ModelWindow]] = None
     extra: Dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
@@ -262,8 +342,50 @@ class PooledCredential:
         # (excluded from ``field_names`` above), never metadata — sweeping it in would write a
         # stray provider name back over the row on to_dict().
         data["extra"] = {
-            k: v for k, v in payload.items() if k not in field_names and k != "provider" and v is not None
+            k: v for k, v in payload.items() if k not in field_names and k != "provider"
+            and k not in LEGACY_WINDOW_KEYS and v is not None
         }
+        # ``model_cooldowns`` rows ride through JSON as {model: {reset_at, consecutive_count,
+        # blocked_until, blocked_reason}}; the upstream bare float bench is the pre-upgrade
+        # value and loads as the blocked slot.  Rows are rebuilt here and malformed ones are
+        # dropped.  The legacy ``rate_limited`` key migrates in place and is excluded from
+        # ``extra`` above so it can never ride back to disk and re-migrate.
+        windows: Dict[str, ModelWindow] = {}
+        raw_windows = data.get("model_cooldowns")
+        if raw_windows is not None and not isinstance(raw_windows, dict):
+            logger.warning(
+                "from_dict: model_cooldowns is %s (expected dict), clearing for provider=%s",
+                type(raw_windows).__name__, provider,
+            )
+        for k, v in (raw_windows if isinstance(raw_windows, dict) else {}).items():
+            row = _window_row(v)
+            if row is None:
+                logger.warning(
+                    "from_dict: model_cooldowns[%r] invalid (%r), dropping for provider=%s", k, v, provider,
+                )
+                continue
+            if row.reset_at is not None and row.reset_at < time.time() - RATE_LIMIT_TTL_MAX_SECONDS:
+                logger.warning(
+                    "from_dict: model_cooldowns[%r] reset_at=%s is stale (more than TTL cap behind now), pruning for provider=%s",
+                    k, row.reset_at, provider,
+                )
+                row = row._replace(reset_at=None, consecutive_count=0)
+            if row.reset_at is not None or row.blocked_until is not None:
+                windows[k] = row
+        raw_legacy_rl = payload.get("rate_limited")
+        if isinstance(raw_legacy_rl, dict):
+            for k, v in raw_legacy_rl.items():
+                row = _window_row(v)
+                if row is None or row.reset_at is None:
+                    continue
+                if row.reset_at < time.time() - RATE_LIMIT_TTL_MAX_SECONDS:
+                    continue
+                current = windows.get(k)
+                if current is None or current.reset_at is None:
+                    windows[k] = (current or ModelWindow())._replace(
+                        reset_at=row.reset_at, consecutive_count=row.consecutive_count
+                    )
+        data["model_cooldowns"] = windows or None
         data.setdefault("id", uuid.uuid4().hex[:6])
         data.setdefault("label", payload.get("source", provider))
         data.setdefault("auth_type", AUTH_TYPE_API_KEY)
@@ -278,6 +400,13 @@ class PooledCredential:
             if field_def.name in {"provider", "extra"}:
                 continue
             value = getattr(self, field_def.name)
+            if field_def.name == "model_cooldowns":
+                value = {
+                    k: _window_json(v)
+                    for k, v in (value or {}).items()
+                    if v is not None and (v.reset_at is not None or v.blocked_until is not None)
+                }
+                value = value or None
             if value is not None or field_def.name in _CLEAR_STATUS:
                 result[field_def.name] = value
         for k, v in self.extra.items():
@@ -397,6 +526,19 @@ def _exhausted_ttl(
     if sole_credential and not is_billing:
         return min(base, EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS)
     return base
+
+
+def _model_rate_limited_until(entry: PooledCredential, model_id: Optional[str]) -> Optional[float]:
+    """Return the open 429 window end for this model, or None.
+
+    Wall clock (``time.time()``) — the same domain ``ModelWindow.reset_at`` is
+    written in, so the value survives a restart and reads identically across processes.
+    """
+    if model_id is not None:
+        row = (entry.model_cooldowns or {}).get(model_id)
+        if row is not None and row.reset_at is not None and time.time() < row.reset_at:
+            return row.reset_at
+    return None
 
 
 def _parse_absolute_timestamp(value: Any) -> Optional[float]:
@@ -2118,6 +2260,30 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 continue
             if model_cooldown_until(entry, model) is not None:
                 continue
+            if model is not None:
+                rl_until = _model_rate_limited_until(entry, model)
+                if rl_until is not None:
+                    # A per-model 429 leaves the credential usable for its sibling models; only
+                    # this model's requests skip it until the window reopens.
+                    continue
+                if clear_expired and entry.model_cooldowns:
+                    live: Dict[str, ModelWindow] = {}
+                    for m, w in entry.model_cooldowns.items():
+                        reset_at = w.reset_at if (w.reset_at is not None and w.reset_at > now) else None
+                        blocked_until = (
+                            w.blocked_until if (w.blocked_until is not None and w.blocked_until > now) else None
+                        )
+                        if reset_at is None and blocked_until is None:
+                            continue
+                        live[m] = w._replace(
+                            reset_at=reset_at,
+                            consecutive_count=(w.consecutive_count if reset_at else 0),
+                            blocked_until=blocked_until,
+                            blocked_reason=(w.blocked_reason if blocked_until else None),
+                        )
+                    if live != entry.model_cooldowns:
+                        entry = self._adopt(entry, persist=False, model_cooldowns=(live or None))
+                        cleared_any = True
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 # Codex quota windows can reopen EARLY; a throttled live probe
@@ -2293,6 +2459,88 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             self._current_id = None
             return None
         return next_entry
+
+    def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
+        """Return the earliest per-model rate-limit TTL across all entries.
+
+        Returns a ``time.time()`` (wall-clock) timestamp, or None when no entry is
+        rate-limited for *model_id*. Callers that need a wait duration subtract
+        ``time.time()``.
+        """
+        now = time.time()
+        min_ttl: Optional[float] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
+        return min_ttl
+
+    def mark_rate_limited(
+        self,
+        entry: PooledCredential,
+        model_id: str,
+        status_code: int,
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> PooledCredential:
+        """Record a per-model 429 without benching the credential.
+
+        A provider may throttle one model while the same key keeps serving its
+        siblings, so the entry stays selectable for every other model. TTL escalates
+        with consecutive 429s on the same model (``credential_pool_strategies``
+        overrides ``RATE_LIMIT_TTL_*``); ``reset_at`` is wall clock so it survives a
+        restart.
+        """
+        now = time.time()
+        existing = (entry.model_cooldowns or {}).get(model_id)
+        if existing is not None and existing.reset_at is not None and existing.reset_at > now:
+            consecutive = existing.consecutive_count + 1
+        else:
+            consecutive = 1
+        config = _load_config_safe() or {}
+        strategies = config.get("credential_pool_strategies", {}) or {}
+        first_ttl = strategies.get("rate_limit_ttl_first_seconds", RATE_LIMIT_TTL_FIRST_SECONDS)
+        step_ttl = strategies.get("rate_limit_ttl_step_seconds", RATE_LIMIT_TTL_STEP_SECONDS)
+        max_ttl = strategies.get("rate_limit_ttl_max_seconds", RATE_LIMIT_TTL_MAX_SECONDS)
+        ttl = min(first_ttl + step_ttl * (consecutive - 1), max_ttl)
+        normalized_error = _normalize_error_context(error_context)
+        # A provider-supplied reset outranks the local ladder: it is the real
+        # reopen time, and ``last_error_reset_at`` mirrors it so the bench and
+        # the window cannot disagree.
+        reset_at = normalized_error.get("reset_at") or (now + ttl)
+        row = (existing or ModelWindow())._replace(reset_at=reset_at, consecutive_count=consecutive)
+        updated = replace(
+            entry,
+            model_cooldowns={**(entry.model_cooldowns or {}), model_id: row},
+            last_error_code=status_code,
+            last_error_reason=normalized_error.get("reason"),
+            last_error_message=normalized_error.get("message"),
+            last_error_reset_at=reset_at,
+            extra=entry.extra,
+        )
+        self._replace_entry(entry, updated)
+        self._persist()
+        return updated
+
+    def clear_rate_limit(self, entry_id: str, model_id: str) -> None:
+        """Drop the entry's open 429 window on success, keeping the blocked slot.
+
+        A later 429 on this model starts a fresh consecutive count instead of
+        extending the previous window. No-op when the entry or window is
+        absent; the change is persisted.
+        """
+        with self._lock:
+            entry = next((e for e in self._entries if e.id == entry_id), None)
+            if entry is None or model_id not in (entry.model_cooldowns or {}):
+                return
+            row = entry.model_cooldowns[model_id]
+            windows = dict(entry.model_cooldowns)
+            if row.blocked_until is None:
+                windows.pop(model_id, None)
+            else:
+                windows[model_id] = row._replace(reset_at=None, consecutive_count=0)
+            updated = replace(entry, model_cooldowns=(windows or None))
+            self._replace_entry(entry, updated)
+            self._persist()
 
     def mark_exhausted_and_rotate(
         self,

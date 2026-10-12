@@ -1074,3 +1074,28 @@ def test_openrouter_loopback_callback_binds_nonce_path_and_rejects_forged_redire
     assert seen["forged_status"] == 404
     assert seen["genuine_status"] == 200
     assert code == "good-code"
+
+
+class TestAuthListModelWindowLines:
+    """auth list shows both window slots per model (429 window / cooldown bench)."""
+
+    def test_both_slots_printed_for_unexpired_rows(self, capsys):
+        from agent.credential_pool import ModelWindow, PooledCredential
+        from hermes_cli.auth_commands import _print_model_window_lines
+
+        now = time.time()
+        entry = PooledCredential(
+            id="w1", provider="test", label="Key", auth_type="api_key",
+            priority=0, source="manual", access_token="k",
+        )
+        entry.model_cooldowns = {
+            "gpt-4": ModelWindow(reset_at=now + 300.0, consecutive_count=2),
+            "claude": ModelWindow(blocked_until=now + 1800.0, blocked_reason="quota"),
+            "expired": ModelWindow(reset_at=now - 5.0, consecutive_count=1),
+        }
+        _print_model_window_lines(entry, "test")
+        out = capsys.readouterr().out
+        assert "429 window gpt-4" in out
+        assert "model-quota claude" in out
+        # Expired rows stay hidden.
+        assert "expired" not in out

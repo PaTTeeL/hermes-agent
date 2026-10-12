@@ -680,6 +680,7 @@ def recover_after_classification(
         status_code=status_code, has_retried_429=_retry.has_retried_429,
         classified_reason=classified.reason, error_context=error_context,
         billing_unverified=classified.billing_unverified,
+        model_id=getattr(agent, "model", "") or "",
     )
     if recovered_with_pool:
         return True, recovered_with_pool
@@ -1912,7 +1913,9 @@ def route_classified_error(
         # Fixes #11314.
         _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
         pool_may_recover = (
-            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
+            False if _is_upstream else _ra()._pool_may_recover_from_rate_limit(
+                agent._credential_pool, model_id=model or ""
+            )
         )
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))

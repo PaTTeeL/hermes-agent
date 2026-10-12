@@ -174,6 +174,43 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
     return "exhausted", True
 
 
+
+def _format_remaining(until_ts: float) -> str:
+    """Format a wall-clock epoch as human-readable remaining time."""
+    remaining = max(0, int(math.ceil(until_ts - time.time())))
+    if remaining == 0:
+        return "expired (ready to retry)"
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m left"
+    if minutes:
+        return f"{minutes}m {seconds}s left"
+    return f"{seconds}s left"
+
+
+def _print_model_window_lines(entry, provider: str) -> None:
+    """Print per-model window lines (429 window / cooldown bench) for an entry.
+
+    Shows both slots for each model, unexpired only (wall clock — the domain
+    ``ModelWindow`` epochs are written in).
+    """
+    windows = getattr(entry, "model_cooldowns", None)
+    if not isinstance(windows, dict) or not windows:
+        return
+    now = time.time()
+    for model_id, row in windows.items():
+        if row is None:
+            continue
+        reset_at = getattr(row, "reset_at", None)
+        if isinstance(reset_at, (int, float)) and reset_at > now:
+            print(f"      └─ 429 window {model_id} ({_format_remaining(float(reset_at))})")
+        blocked_until = getattr(row, "blocked_until", None)
+        if isinstance(blocked_until, (int, float)) and blocked_until > now:
+            reason = getattr(row, "blocked_reason", None) or "cooldown"
+            print(f"      └─ model-{reason} {model_id} ({_format_remaining(float(blocked_until))})")
+
+
 def _format_exhausted_status(entry) -> str:
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
@@ -539,6 +576,10 @@ def auth_list_command(args) -> None:
                 f"id={entry.id} priority={entry.priority} {source}{status} {marker}"
             )
             print(row.rstrip())
+            # Per-model windows (429 window / cooldown bench) — shown for
+            # entries that carry at least one window row.
+            if getattr(entry, "model_cooldowns", None):
+                _print_model_window_lines(entry, provider)
         print()
     if not provider_filter or provider_filter in EXTERNAL_LOGIN_PROVIDERS:
         _print_external_login_notice()

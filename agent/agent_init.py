@@ -2448,6 +2448,18 @@ def init_agent(
         if isinstance(key, str) and isinstance(value, bool)
     }
     agent._credential_pool = credential_pool
+    # Load the custom provider's credential pool if not already supplied. Custom pools are
+    # keyed "custom:<name>", so resolve the key from base_url.
+    if agent._credential_pool is None and agent.provider == "custom":
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key, load_pool
+            _pool_key = get_custom_provider_pool_key(agent.base_url)
+            if _pool_key:
+                _pool = load_pool(_pool_key)
+                if _pool.has_credentials():
+                    agent._credential_pool = _pool
+        except Exception:
+            pass
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
     _resolve_api_mode(agent, api_mode, provider_name, base_url)

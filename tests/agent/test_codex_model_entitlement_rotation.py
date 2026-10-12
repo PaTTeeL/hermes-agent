@@ -76,7 +76,7 @@ def test_entitlement_400_benches_only_that_model_and_rotates(pool):
     assert first.last_status is None  # credential-wide state untouched: other models stay usable
     assert set(first.model_cooldowns) == {MODEL}
     # An entitlement is a plan property, not a window: no hourly re-probe, only reset clears it.
-    assert first.model_cooldowns[MODEL] > time.time() + 24 * 3600
+    assert first.model_cooldowns[MODEL].blocked_until > time.time() + 24 * 3600
     assert pool.select(model=OTHER_MODEL).id == "cred-0"
     assert pool.reset_statuses() >= 1 and not pool.entries()[0].model_cooldowns
 

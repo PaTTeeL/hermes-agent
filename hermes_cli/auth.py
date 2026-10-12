@@ -1058,13 +1058,22 @@ def _merge_disk_cooldown_state(
     try:
         from agent.credential_pool import (
             PooledCredential, STATUS_DEAD, STATUS_EXHAUSTED, _exhausted_until, _parse_absolute_timestamp,
+            _window_json,
         )
 
-        # Model cooldowns are independent observations: keep the latest reset per model so a
-        # writer that just cooled one model cannot erase another process's cooldown for another.
+        # Per-model windows are independent observations: keep the latest slot per model so a
+        # writer that just cooled one model cannot erase another process's window for another.
+        # Legacy keys and value shapes fold in so windows persisted under earlier keys are kept.
         from agent.credential_pool_model_cooldowns import merge_model_cooldowns
-        merged_cooldowns = merge_model_cooldowns(disk_entry.get("model_cooldowns"), entry.get("model_cooldowns"))
-        merged = {**entry, "model_cooldowns": merged_cooldowns} if merged_cooldowns else entry
+        merged_windows = {
+            model: _window_json(row)
+            for model, row in merge_model_cooldowns(
+                disk_entry.get("model_cooldowns"),
+                entry.get("model_cooldowns"),
+                disk_entry.get("rate_limited"),
+            ).items()
+        }
+        merged = {**entry, "model_cooldowns": merged_windows} if merged_windows else entry
         disk_status_fields = {f: disk_entry.get(f) for f in _POOL_STATUS_FIELDS}
 
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0

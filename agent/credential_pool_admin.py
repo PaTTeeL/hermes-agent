@@ -14,7 +14,15 @@ def _cleared_status_copy(entry: PooledCredential) -> PooledCredential:
 
     # The reset marker lets a live pool in another process tell "reset after my cooldown" from
     # "never had a status" — both read as bare None on disk (#89415).
-    return replace(entry, **_CLEAR_STATUS, model_cooldowns=None, status_cleared_at=time.time(),
+    windows = {}
+    for m, w in (entry.model_cooldowns or {}).items():
+        if w is None:
+            continue
+        if w.blocked_until is not None:
+            w = w._replace(blocked_until=None, blocked_reason=None)
+        if w.reset_at is not None:
+            windows[m] = w
+    return replace(entry, **_CLEAR_STATUS, model_cooldowns=(windows or None), status_cleared_at=time.time(),
                    extra={k: v for k, v in entry.extra.items() if k != "failure_reason"})
 
 
@@ -42,7 +50,8 @@ class CredentialPoolAdminMixin:
         with self._lock:
             stale = [
                 e for e in self._entries
-                if e.last_status or e.last_status_at or e.last_error_code or e.failure_reason or e.model_cooldowns
+                if e.last_status or e.last_status_at or e.last_error_code or e.failure_reason
+                or any(w.blocked_until is not None for w in (e.model_cooldowns or {}).values() if w is not None)
             ]
             if stale:
                 stale_ids = {e.id for e in stale}
