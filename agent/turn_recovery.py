@@ -1454,6 +1454,22 @@ def compute_error_backoff(
         wait_time, _backoff_policy = adaptive_rate_limit_backoff(
             retry_count, base_url=str(base_url), model=model, error=api_error, default_wait=wait_time,
         )
+    if _adaptive and is_rate_limited and _retry_after is None:
+        # Per-model TTL alignment: floor the wait at the pool's remaining unlock
+        # time for this (key, model), capped at the TTL-ladder ceiling; a
+        # pool-less agent or absent record keeps the plain backoff.
+        _pool = getattr(agent, "_credential_pool", None)
+        _rtl_fn = getattr(_pool, "rate_limit_min_ttl", None) if _pool is not None else None
+        if _rtl_fn is not None and model:
+            _rl_until = _rtl_fn(str(model))
+            if isinstance(_rl_until, (int, float)):
+                from agent.credential_pool import RATE_LIMIT_TTL_MAX_SECONDS, _load_config_safe
+                _cfg = _load_config_safe() or {}
+                _cap = float((_cfg.get("credential_pool_strategies", {}) or {}).get(
+                    "rate_limit_ttl_max_seconds", RATE_LIMIT_TTL_MAX_SECONDS))
+                _remaining = _rl_until - time.time()
+                if _remaining > 0:
+                    wait_time = max(wait_time, min(_remaining, _cap))
     _reset = reset_hint(api_error) if _adaptive else ""
     _wait_reason = "Provider overloaded" if is_zai_coding_overload and not is_rate_limited else "Rate limited"
     if _adaptive:
@@ -1922,6 +1938,28 @@ def route_classified_error(
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
+            # The whole chain is rate-limited: wait for the current model's window to
+            # reopen, then retry this request instead of failing the turn. The retry
+            # re-reads the window, so the wait repeats until a window opens, no unlock
+            # event remains, or the turn is interrupted.
+            if is_rate_limited and not _is_upstream:
+                from agent.conversation_loop import _do_chain_exhausted_sleep
+                if _do_chain_exhausted_sleep(agent):
+                    retry_count = 0
+                    return _verdict("continue")
+
+    # No fallback chain configured: a rate-limited primary with nowhere to rotate waits out
+    # the window and retries — the same wait rule as an exhausted chain.
+    if (
+        is_rate_limited
+        and classified.reason != FailoverReason.upstream_rate_limit
+        and not recovered_with_pool
+        and agent._fallback_index >= len(agent._fallback_chain)
+    ):
+        from agent.conversation_loop import _do_chain_exhausted_sleep
+        if _do_chain_exhausted_sleep(agent):
+            retry_count = 0
+            return _verdict("continue")
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
     # escalate to the fallback chain once; False -> terminal handling.

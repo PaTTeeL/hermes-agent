@@ -1205,6 +1205,59 @@ def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
     reconstruct_static_prefix(agent, system_message=system_message, log_label="failover redecoration")
 
 
+def _interruptible_sleep(agent, seconds: float, *, status_msg: Optional[str] = None) -> bool:
+    """Sleep in short slices so an interrupt lands promptly.
+
+    Returns True when the full span elapsed, False when the turn was interrupted.
+    A 429 window can be minutes long, and a plain ``time.sleep`` would swallow a
+    Ctrl-C / ``/stop`` for its whole duration.
+    """
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        if status_msg and remaining > 1.0:
+            try:
+                agent._emit_status(f"{status_msg} (~{remaining:.0f}s left)...")
+            except Exception:
+                pass
+        time.sleep(min(0.2, remaining))
+
+
+def _do_chain_exhausted_sleep(agent) -> bool:
+    """Wait for the current model's 429 window to reopen when every backend in the chain is
+    rate-limited.
+
+    The primary and every fallback exhausted their retries, so no request can succeed until
+    the model's rate-limit window lifts. Sleeping and retrying beats failing the turn outright;
+    each wake re-reads the pool, so the wait follows the window's current end and may repeat.
+    When the pool carries no rate-limit record for the model there is no unlock event to wait
+    for, so this returns False and the caller keeps its terminal handling.
+    """
+    pool = getattr(agent, "_credential_pool", None)
+    model = getattr(agent, "model", "") or ""
+    sleep_until: Optional[float] = None
+    if pool is not None:
+        try:
+            sleep_until = pool.rate_limit_min_ttl(model)
+        except Exception:
+            sleep_until = None
+    now = time.time()
+    if sleep_until is None or sleep_until <= now:
+        return False
+    wait = sleep_until - now
+    logger.info(
+        "All backends rate-limited — waiting %.0fs for the %s window", wait, model or "?",
+    )
+    agent._buffer_diagnostic_status(
+        f"⏳ All backends rate-limited — waiting {wait:.0f}s for the window to reopen..."
+    )
+    return _interruptible_sleep(agent, wait, status_msg="⏳ Waiting for rate limit")
+
+
 def _peel_moa_guidance(messages: List[Dict[str, Any]], guidance: Any) -> List[Dict[str, Any]]:
     """Remove MoA reference guidance attached by ``_attach_reference_guidance``."""
     from agent.moa_loop import peel_reference_guidance

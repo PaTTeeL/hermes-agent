@@ -212,3 +212,85 @@ class TestRecoveryPathFirst429:
         row = (pool.entries()[0].model_cooldowns or {}).get("gpt-4")
         assert row is not None
         assert abs(row.reset_at - (WALL_NOW + 300.0)) < 1.0
+
+
+class _FakeAgent:
+    """Minimal agent surface consumed by compute_error_backoff."""
+
+    def __init__(self, pool=None):
+        self._credential_pool = pool
+
+    def _buffer_diagnostic_status(self, msg):
+        pass
+
+    def _emit_diagnostic_status(self, msg):
+        pass
+
+    def _emit_diagnostic_wait(self, msg):
+        pass
+
+    def _client_log_context(self):
+        return {}
+
+
+class TestBackoffAlignedWithPerModelTTL:
+    """compute_error_backoff floors the 429 wait at the per-model TTL remaining,
+    capped at the TTL-ladder ceiling."""
+
+    @pytest.fixture
+    def pool_with_entry(self):
+        entry = PooledCredential(
+            id="test1", provider="test", label="Test Key", auth_type="api_key",
+            priority=0, source="manual", access_token="test-key",
+        )
+        with patch.object(CredentialPool, "_persist", return_value=None):
+            pool = CredentialPool("test", [entry])
+        return pool, entry
+
+    def _backoff(self, agent, model):
+        from agent.turn_recovery import compute_error_backoff
+        return compute_error_backoff(
+            agent, Exception("429 rate limited"), retry_count=1, max_retries=35,
+            is_rate_limited=True, is_zai_coding_overload=False, base_url="", model=model,
+        )
+
+    def test_wait_floors_at_ttl_remaining(self, pool_with_entry):
+        """With an active per-model TTL, the wait is at least the TTL remaining."""
+        pool, entry = pool_with_entry
+        pool.mark_rate_limited(entry, "m1", 429)  # default first TTL = 300s
+        wait = self._backoff(_FakeAgent(pool), "m1")
+        # jittered backoff alone is <= 60s; TTL floor must dominate.
+        assert wait >= 290.0
+
+    def test_wait_without_ttl_is_plain_backoff(self, pool_with_entry):
+        """No active TTL record -> plain backoff (<= its 60s ceiling)."""
+        pool, _entry = pool_with_entry
+        wait = self._backoff(_FakeAgent(pool), "m1")
+        assert wait <= 60.5
+
+    def test_wait_ttl_capped_at_max(self, pool_with_entry):
+        """The TTL floor is clamped by rate_limit_ttl_max_seconds."""
+        pool, entry = pool_with_entry
+        pool.mark_rate_limited(entry, "m1", 429)
+        # Shrink the cap below the written TTL so the clamp branch must fire.
+        with patch("agent.credential_pool._load_config_safe",
+                   return_value={"credential_pool_strategies": {"rate_limit_ttl_max_seconds": 100}}):
+            wait = self._backoff(_FakeAgent(pool), "m1")
+        assert 95.0 <= wait <= 101.0
+
+    def test_retry_after_value_wins_over_the_floor(self, pool_with_entry):
+        """A Retry-After value is honored as-is; the TTL floor does not extend it."""
+        from agent.turn_recovery import compute_error_backoff
+
+        class _Resp:
+            headers = {"retry-after": "7"}
+
+        pool, entry = pool_with_entry
+        pool.mark_rate_limited(entry, "m1", 429)  # floor would be ~300s
+        err = Exception("429 rate limited")
+        err.response = _Resp()
+        wait = compute_error_backoff(
+            _FakeAgent(pool), err, retry_count=1, max_retries=35,
+            is_rate_limited=True, is_zai_coding_overload=False, base_url="", model="m1",
+        )
+        assert wait == pytest.approx(7, abs=1)
