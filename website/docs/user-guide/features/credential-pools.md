@@ -203,7 +203,7 @@ The pool handles different errors differently:
 
 | Error | Behavior | Cooldown |
 |-------|----------|----------|
-| **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 rotates to next key | 1 hour |
+| **429 Rate Limit** | Retry same key once (transient). Second consecutive 429 marks a **per-model** rate limit on that key (other models unaffected) and rotates to next key | 5 min → 10 min → 15 min → 1 hour (TTL escalation, capped) |
 | **402 Billing/Quota** | Immediately rotate to next key | 1 hour |
 | **401 Auth Expired** | Try refreshing the OAuth token first. Rotate only if refresh fails | 5 minutes |
 | **400 Codex model entitlement** (`The '<model>' model is not supported when using Codex with a ChatGPT account.`) | Bench this key for the rejected model only and rotate to the next key; other models keep using the key. Other 400s never rotate | Until `hermes auth reset` (per model; an entitlement is a plan property, not a window) |
@@ -249,6 +249,15 @@ CLI while its only credential is benched or quarantined, startup prints the fail
 the remaining cooldown (or the `hermes auth add <provider>` re-login for a dead one) — the first-run
 "No inference provider is configured yet" wizard is offered only when the resolver finds nothing
 configured at all.
+
+Per-model rate-limit TTLs escalate with consecutive 429s on the same model. Configure via:
+
+```yaml
+credential_pool_strategies:
+  rate_limit_ttl_first_seconds: 300   # first 429 → 5 min
+  rate_limit_ttl_step_seconds: 300    # each consecutive → +5 min
+  rate_limit_ttl_max_seconds: 3600    # cap at 1 hour
+```
 
 ## Custom Endpoint Pools
 
