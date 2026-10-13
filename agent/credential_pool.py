@@ -283,6 +283,34 @@ def _normalize_pool_auth_type(provider: str, token: Any, auth_type: Any) -> str:
     return str(auth_type or AUTH_TYPE_API_KEY)
 
 
+# 429 self-healing wait strategy: which backend's window the chain-exhausted wait
+# sleeps for, overridden by credential_pool_strategies in config.yaml.
+SELF_HEALING_STRATEGY_STRICT_SEQUENTIAL = "strict_sequential"
+SELF_HEALING_STRATEGY_PRIMARY_ELSE_FASTEST = "primary_else_fastest"
+SELF_HEALING_STRATEGY_FASTEST_RECOVERY = "fastest_recovery"
+SELF_HEALING_STRATEGY_CURRENT_ONLY = "current_only"
+SUPPORTED_SELF_HEALING_STRATEGIES = (
+    SELF_HEALING_STRATEGY_STRICT_SEQUENTIAL,
+    SELF_HEALING_STRATEGY_PRIMARY_ELSE_FASTEST,
+    SELF_HEALING_STRATEGY_FASTEST_RECOVERY,
+    SELF_HEALING_STRATEGY_CURRENT_ONLY,
+)
+
+
+def get_self_healing_strategy() -> str:
+    """Read ``credential_pool_strategies.self_healing_strategy`` from config.
+
+    Returns the strategy string (one of the ``SELF_HEALING_STRATEGY_*`` constants).
+    Defaults to ``strict_sequential`` when unset or unrecognised.
+    """
+    config = _load_config_safe()
+    strategies = (config or {}).get("credential_pool_strategies", {})
+    val = (strategies.get("self_healing_strategy") or "").strip().lower()
+    if val in SUPPORTED_SELF_HEALING_STRATEGIES:
+        return val
+    return SELF_HEALING_STRATEGY_STRICT_SEQUENTIAL
+
+
 @dataclass
 class PooledCredential:
     provider: str
@@ -1203,8 +1231,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     def next_available_at(self, *, model: Optional[str] = None) -> Optional[float]:
         """Earliest epoch time (seconds) any entry re-enters rotation.
 
-        ``None`` when an entry is available now, or when no exhausted entry
-        carries a usable recovery time (empty pool, or only ``STATUS_DEAD``
+        Exhaustion benches, model cooldowns, and per-model 429 windows all
+        contribute. ``None`` when an entry is available now, or when no blocked
+        entry carries a usable recovery time (empty pool, or only ``STATUS_DEAD``
         entries). Callers must treat ``None`` as "no wait information".
         Runs under ``self._lock`` for the same reason as ``has_available``.
         """
@@ -1229,7 +1258,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 until
                 for entry in self._entries
                 if entry.last_status != STATUS_DEAD
-                for until in (model_cooldown_until(entry, model),)
+                for until in (
+                    model_cooldown_until(entry, model),
+                    _model_rate_limited_until(entry, model),
+                )
                 if until is not None
             )
             return min(candidates) if candidates else None

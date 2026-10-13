@@ -214,6 +214,21 @@ def _notify_context_engine_session_end(agent: Any, messages: Optional[list]) -> 
         _quietly(lambda: engine.on_session_end(agent.session_id or "", messages or []))
 
 
+# A per-model 429 window farther out than this is not worth waiting out: with a
+# fallback chain in play the recovery path switches instead.
+RATE_LIMIT_WAIT_THRESHOLD_DEFAULT_SECONDS = 600.0
+
+
+def _rate_limit_wait_threshold_seconds() -> float:
+    """Read ``credential_pool_strategies.rate_limit_wait_threshold_seconds`` (default 600)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        strategies = (load_config_readonly() or {}).get("credential_pool_strategies", {}) or {}
+        return float(strategies.get("rate_limit_wait_threshold_seconds", RATE_LIMIT_WAIT_THRESHOLD_DEFAULT_SECONDS))
+    except Exception:
+        return RATE_LIMIT_WAIT_THRESHOLD_DEFAULT_SECONDS
+
+
 def _pool_may_recover_from_rate_limit(
     pool, *, model_id: str = ""
 ) -> bool:
@@ -230,7 +245,11 @@ def _pool_may_recover_from_rate_limit(
     immediately, and the retry budget is burned.
 
     When *model_id* is given, also checks per-model rate-limit state: if every
-    pool entry is rate-limited for that model, rotation cannot recover.
+    pool entry is rate-limited for that model, rotation cannot recover.  A
+    per-model window reopening farther out than the configured wait threshold
+    (``credential_pool_strategies.rate_limit_wait_threshold_seconds``, default
+    600s) is not worth waiting out — the caller switches to a fallback instead
+    of burning its retry budget on one long sleep.
 
     In those cases we must fall back to the configured ``fallback_model``
     instead.  Returns True only when rotation has somewhere to go.
@@ -245,6 +264,15 @@ def _pool_may_recover_from_rate_limit(
     # expired rate limits and triggers OAuth refresh as a side effect.
     available, _pending = pool._available_entries(model=model_id or None)
     if not available:
+        # A per-model window farther out than the wait threshold is not worth
+        # waiting out — with a fallback chain in play the caller switches instead.
+        if model_id:
+            try:
+                window = pool.rate_limit_min_ttl(model_id)
+            except Exception:
+                window = None
+            if window is not None and window - time.time() > _rate_limit_wait_threshold_seconds():
+                return False
         # No entry available for this model right now.
         #
         # Single-key pool (common for Gemini OAuth, Vertex service accounts,

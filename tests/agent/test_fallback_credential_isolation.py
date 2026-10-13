@@ -123,9 +123,10 @@ class TestFallbackCredentialIsolation:
         assert agent._credential_pool.provider == "openai-codex"
         assert agent._transport_cache == {}
 
-    def test_fallback_skips_a_candidate_whose_pool_is_exhausted_for_hours(self):
-        """#89401: a fallback whose every credential is benched until the weekly quota resets is
-        skipped before any client is built; a short throttle on the next candidate is still tried."""
+    def test_fallback_skips_candidates_with_nothing_usable_right_now(self):
+        """#89401 lineage: candidates whose pools have nothing usable for the model right now are
+        skipped before any client is built — a blocked candidate (even briefly throttled) is not a
+        switch target; the chain-exhausted wait covers it instead."""
         import time
         from agent.chat_completion_helpers import try_activate_fallback
 
@@ -151,11 +152,13 @@ class TestFallbackCredentialIsolation:
         client = SimpleNamespace(api_key="k", base_url="https://openrouter.ai/api/v1", _custom_headers={})
 
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "m")) as resolve, \
-                patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]):
-            assert try_activate_fallback(agent) is True
+                patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]) as load_pool_mock:
+            assert try_activate_fallback(agent) is False
 
-        assert resolve.call_count == 1 and resolve.call_args.args[0] == "openrouter"
-        assert agent.provider == "openrouter" and agent._credential_pool is throttled
+        # Screening read both candidate pools; no client was built and the binding is unchanged.
+        assert resolve.call_count == 0
+        assert {"openai-codex", "openrouter"} <= {c.args[0] for c in load_pool_mock.call_args_list}
+        assert agent.provider == "anthropic" and agent._credential_pool is not throttled
 
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────
 

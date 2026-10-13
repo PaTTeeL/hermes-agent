@@ -113,6 +113,27 @@ class TestDualSlotSemantics:
         assert pool.select(model="bw") is None
         assert pool.select(model="other") is not None
 
+    def test_next_available_at_min_over_both_slots(self):
+        """next_available_at counts the 429 window alongside the blocked slot."""
+        now = time.time()
+        entry = PooledCredential.from_dict("test", _payload(
+            model_cooldowns={"m": {
+                "reset_at": now + 300, "consecutive_count": 1,
+                "blocked_until": now + 900, "blocked_reason": "cooldown",
+            }},
+        ))
+        pool = self._pool(entry)
+        assert pool.next_available_at(model="m") == now + 300
+
+        entry2 = PooledCredential.from_dict("test", _payload(
+            model_cooldowns={"m2": {
+                "reset_at": now + 900, "consecutive_count": 1,
+                "blocked_until": now + 300, "blocked_reason": "cooldown",
+            }},
+        ))
+        pool2 = self._pool(entry2)
+        assert pool2.next_available_at(model="m2") == now + 300
+
     def test_success_clear_keeps_blocked_slot(self):
         now = time.time()
         entry = PooledCredential.from_dict("test", _payload(

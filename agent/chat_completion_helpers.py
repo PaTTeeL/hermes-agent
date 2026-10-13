@@ -1944,9 +1944,10 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None") -> bool:
 
 
 def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
-    """True when every credential the candidate would use sits in an exhaustion cooldown longer
-    than the retry loop's longest wait (the 600s Retry-After cap): switching to it only fails the
-    turn the same way the primary just did (#89401). A short throttle still gets its chance."""
+    """True when the candidate's pool has no credential usable for this model right now:
+    switching to it only fails the turn the same way the primary just did (#89401). The
+    pool's cooldowns and per-model 429 windows decide directly; a merely blocked candidate
+    is not a switch target and is covered by the chain-exhausted wait."""
     pool = getattr(agent, "_credential_pool", None)
     if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
         try:
@@ -1954,10 +1955,9 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
             pool = load_pool(fb_provider)
         except Exception:
             return False
-    if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
+    if pool is None or not pool.has_credentials():
         return False
-    until = pool.next_available_at(model=fb_model)
-    return until is None or until - time.time() > 600
+    return not pool.has_available(model=fb_model)
 
 
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
@@ -1973,7 +1973,7 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
-        logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        logger.warning("Fallback skip: %s/%s has no credential usable right now (cooldown or per-model 429 window)", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
