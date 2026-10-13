@@ -23,6 +23,7 @@ from agent.credential_pool import (
     STATUS_EXHAUSTED,
     STATUS_OK,
     CredentialPool,
+    ModelWindow,
     PooledCredential,
 )
 
@@ -38,6 +39,7 @@ def _entry(
     reset_at=None,
     status_at=None,
     error_code=None,
+    model_cooldowns=None,
 ):
     return PooledCredential(
         provider=provider,
@@ -51,6 +53,7 @@ def _entry(
         last_status_at=status_at,
         last_error_code=error_code,
         last_error_reset_at=reset_at,
+        model_cooldowns=model_cooldowns,
     )
 
 
@@ -315,3 +318,46 @@ class TestResetAwareRestoreGate:
         assert agent._restore_primary_runtime() is False
         # Reset-aware gate never consulted — short-circuited by the 60s gate.
         assert pool.next_available_calls == 0
+
+    def test_stays_on_fallback_while_per_model_window_active(self):
+        """The primary's open per-model 429 window blocks the restore."""
+        agent = _make_agent(fallback_model=self.FB)
+        agent._primary_runtime = {**agent._primary_runtime, "model": "test-model"}
+        _activate_fallback(agent)
+        agent._rate_limited_until = 0  # 60s transient cooldown already cleared
+
+        now = time.time()
+        agent._credential_pool = CredentialPool("custom", [
+            _entry(
+                provider="custom",
+                id="rl-1",
+                model_cooldowns={"test-model": ModelWindow(reset_at=now + 3600, consecutive_count=1)},
+            ),
+        ])
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is False
+        assert agent._fallback_activated is True
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-sonnet-4"
+
+    def test_restores_once_per_model_window_elapsed(self):
+        """An elapsed per-model window no longer blocks: the primary restores."""
+        agent = _make_agent(fallback_model=self.FB)
+        agent._primary_runtime = {**agent._primary_runtime, "model": "test-model"}
+        _activate_fallback(agent)
+        agent._rate_limited_until = 0
+
+        now = time.time()
+        agent._credential_pool = CredentialPool("custom", [
+            _entry(
+                provider="custom",
+                id="rl-2",
+                model_cooldowns={"test-model": ModelWindow(reset_at=now - 5, consecutive_count=1)},
+            ),
+        ])
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._fallback_activated is False
+        assert agent.model == "test-model"
