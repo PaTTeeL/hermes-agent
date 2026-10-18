@@ -71,6 +71,31 @@ def merge_model_cooldowns(*maps: Any) -> Dict[str, Any]:
     return merged
 
 
+def prune_expired_windows(rows: Dict[str, "ModelWindow"]) -> Dict[str, "ModelWindow"]:
+    """Drop elapsed window slots from merged rows; keep rows with a live slot.
+
+    Same slot semantics as the pool scan's clear-expired pass: an elapsed
+    reset slot clears with its ladder count, and an elapsed blocked slot
+    clears with its reason.
+    """
+    now = time.time()
+    pruned: Dict[str, "ModelWindow"] = {}
+    for model, row in rows.items():
+        reset_at = row.reset_at if (row.reset_at is not None and row.reset_at > now) else None
+        blocked_until = (
+            row.blocked_until if (row.blocked_until is not None and row.blocked_until > now) else None
+        )
+        if reset_at is None and blocked_until is None:
+            continue
+        pruned[model] = row._replace(
+            reset_at=reset_at,
+            consecutive_count=(row.consecutive_count if reset_at is not None else 0),
+            blocked_until=blocked_until,
+            blocked_reason=(row.blocked_reason if blocked_until is not None else None),
+        )
+    return pruned
+
+
 class CredentialPoolModelCooldownMixin:
     def token_is_blocked(self, token: str, *, model: Optional[str] = None) -> bool:
         """Whether a pool cooldown blocks *token* for *model*.

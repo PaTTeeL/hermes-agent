@@ -187,3 +187,39 @@ class TestProviderResetPriority:
         row = updated.model_cooldowns["m1"]
         assert row.reset_at is not None
         assert 290.0 <= row.reset_at - now <= 310.0  # repo default first window = 300s
+
+
+class TestExpiredWindowPruning:
+    def test_elapsed_slots_drop_and_live_slots_keep(self):
+        from agent.credential_pool_model_cooldowns import prune_expired_windows
+
+        now = time.time()
+        rows = {
+            "expired": ModelWindow(reset_at=now - 60, consecutive_count=3),
+            "live_reset": ModelWindow(reset_at=now + 300, consecutive_count=2),
+            "live_blocked": ModelWindow(blocked_until=now + 600, blocked_reason="cooldown"),
+            "half": ModelWindow(
+                reset_at=now - 5, consecutive_count=1,
+                blocked_until=now + 900, blocked_reason="cooldown",
+            ),
+        }
+        pruned = prune_expired_windows(rows)
+        assert set(pruned) == {"live_reset", "live_blocked", "half"}
+        assert pruned["live_reset"].consecutive_count == 2
+        half = pruned["half"]
+        assert half.reset_at is None and half.consecutive_count == 0
+        assert half.blocked_until == now + 900 and half.blocked_reason == "cooldown"
+
+    def test_elapsed_blocked_slot_clears_its_reason(self):
+        from agent.credential_pool_model_cooldowns import prune_expired_windows
+
+        now = time.time()
+        pruned = prune_expired_windows({
+            "m": ModelWindow(
+                reset_at=now + 60, consecutive_count=1,
+                blocked_until=now - 30, blocked_reason="cooldown",
+            ),
+        })
+        row = pruned["m"]
+        assert row.reset_at == now + 60 and row.consecutive_count == 1
+        assert row.blocked_until is None and row.blocked_reason is None

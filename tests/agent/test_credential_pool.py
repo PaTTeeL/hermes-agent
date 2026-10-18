@@ -1948,10 +1948,10 @@ class TestCredentialPoolQueryLocking:
     and the management surface (``has_credentials``/``reset_statuses``/
     ``remove_index``/``resolve_target``/``add_entry``) reads or rebinds
     ``self._entries`` and persists auth.json, so they must all hold the
-    same lock every mutating entry point uses.  A naive fix would deadlock
-    because the lock is non-reentrant and ``peek`` calls ``current`` +
-    ``_available_entries``; these tests guard both the no-deadlock and the
-    actually-locked properties.
+    same lock every mutating entry point uses.  The lock is an RLock, so
+    ``peek`` calling ``current`` + ``_available_entries`` re-enters for
+    free; these tests guard both the no-deadlock and the actually-locked
+    properties.
     """
 
     def test_query_methods_do_not_deadlock(self, tmp_path, monkeypatch):
@@ -1968,10 +1968,37 @@ class TestCredentialPoolQueryLocking:
         # (env may seed extra singleton entries; just assert ours are present)
         assert {"cred-1", "cred-2"} <= {e.id for e in pool.entries()}
         # try_refresh_matching's no-hint branch resolves the current entry
-        # while already holding the lock — must use _current_unlocked(), not
-        # current(), or it deadlocks on the non-reentrant lock (found when
-        # rebasing this fix over the #69843 salvage which added the method).
+        # while already holding the lock — the already-locked path uses
+        # _current_unlocked().
         pool.try_refresh_matching()
+
+    def test_available_entries_self_locks_for_bare_callers(self, tmp_path, monkeypatch):
+        """A bare ``pool._available_entries(...)`` call holds ``self._lock``.
+
+        The lock is an RLock, so in-pool callers re-enter it freely; only a
+        probe from outside the pool (a helper thread) can observe ownership.
+        """
+        pool = _load_two_ok_pool(tmp_path, monkeypatch)
+        import threading as _t
+
+        blocked = _t.Event()
+        original = pool._available_entries_unlocked
+
+        def _probe(**kwargs):
+            def _try():
+                if not pool._lock.acquire(blocking=False):
+                    blocked.set()
+                else:
+                    pool._lock.release()
+
+            worker = _t.Thread(target=_try)
+            worker.start()
+            worker.join(timeout=5)
+            return original(**kwargs)
+
+        pool._available_entries_unlocked = _probe
+        pool._available_entries()  # bare call, no lock held by the caller
+        assert blocked.is_set(), "_available_entries did not hold self._lock for a bare call"
 
 
 

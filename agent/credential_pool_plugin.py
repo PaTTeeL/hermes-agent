@@ -65,21 +65,30 @@ def is_terminal_plugin_refresh_error(exc: BaseException) -> bool:
     return bool(exc.relogin_required) or (exc.code or "") in _OAUTH_GRANT_DEAD_CODES
 
 
-def recover_failed_plugin_refresh(
+def plan_failed_plugin_refresh(
     pool: "CredentialPool", entry: "PooledCredential", exc: Exception,
-) -> Tuple[bool, Optional["PooledCredential"]]:
-    """Recovery for a plugin hook that raised: adopt a peer's rotation, or quarantine a dead grant.
+) -> Tuple[bool, Optional["PooledCredential"], Optional["_RefreshSettlement"]]:
+    """Plan recovery for a plugin hook that raised: adopt a peer's rotation, or quarantine a dead grant.
 
-    Returns ``(handled, result)``; ``handled=False`` means the caller should bench the row as a
-    transient failure. A peer process may have rotated the single-use token between our in-lock
-    sync and the hook's POST — adopt that pair before classifying the failure.
+    Returns ``(handled, result, settlement)``; ``handled=False`` means the
+    caller benches the row as a transient failure (the settlement may still
+    carry a peer-adopted row). A peer process may have rotated the single-use
+    token between our in-lock sync and the hook's POST — adopt that pair
+    before classifying the failure. The roster effects ride the settlement;
+    this function itself makes no mutations.
     """
-    from agent.credential_pool import _MARK_OK
+    from agent.credential_pool import _MARK_OK, _RefreshSettlement, _merge_settlements
 
-    synced = pool._sync_entry_from_pool_store(entry)
-    if synced.refresh_token != entry.refresh_token and (synced.access_token or "").strip():
-        logger.debug("%s refresh failed but the pool store has newer tokens — adopting", pool.provider)
-        return True, pool._adopt(synced, **_MARK_OK)
+    carried: Optional["_RefreshSettlement"] = None
+    _, replacement, pair = pool._pool_store_tokens_read(entry)
+    if replacement is not None:
+        if replacement.refresh_token != entry.refresh_token and (replacement.access_token or "").strip():
+            logger.debug("%s refresh failed but the pool store has newer tokens — adopting", pool.provider)
+            adopted = replace(replacement, **_MARK_OK)
+            return True, adopted, _RefreshSettlement(replace_with=adopted, persist=True, record_pair=pair)
+        carried = _RefreshSettlement(replace_with=replacement, record_pair=pair)
+    elif pair is not None:
+        carried = _RefreshSettlement(record_pair=pair)
     if is_terminal_plugin_refresh_error(exc):
         # WARNING, not debug: this is the moment a login is lost. Benching for a TTL would replay
         # the dead token every cooldown at DEBUG with no trace for the user.
@@ -88,6 +97,19 @@ def recover_failed_plugin_refresh(
             "Re-run 'hermes auth add %s' to sign in again.",
             pool.provider, entry.label or entry.id[:8], exc, pool.provider,
         )
-        pool._mark_dead_refresh_grant(entry, exc)
-        return True, None
-    return False, None
+        return True, None, _merge_settlements(carried, _RefreshSettlement(mark_dead=True, exc=exc))
+    return False, None, carried
+
+
+def recover_failed_plugin_refresh(
+    pool: "CredentialPool", entry: "PooledCredential", exc: Exception,
+) -> Tuple[bool, Optional["PooledCredential"]]:
+    """Recovery for a plugin hook that raised (plan, then apply in place).
+
+    See ``plan_failed_plugin_refresh``; the locked refresh path calls the plan
+    directly and defers the application to its settlement.
+    """
+    handled, result, settlement = plan_failed_plugin_refresh(pool, entry, exc)
+    if settlement is not None:
+        pool._apply_refresh_settlement(entry, settlement)
+    return handled, result

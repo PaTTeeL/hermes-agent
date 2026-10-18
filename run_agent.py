@@ -260,8 +260,8 @@ def _pool_may_recover_from_rate_limit(
         return False
     if not pool.has_available():
         return False
-    # Read-only emptiness check — avoid select() here because it clears
-    # expired rate limits and triggers OAuth refresh as a side effect.
+    # Emptiness probe — avoid select() here because it clears expired rate
+    # limits and triggers OAuth refresh as a side effect; may prune aged DEAD rows.
     available, _pending = pool._available_entries(model=model_id or None)
     if not available:
         # A per-model window farther out than the wait threshold is not worth
