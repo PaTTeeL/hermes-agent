@@ -381,3 +381,44 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_write_pool_reaps_expired_model_windows(classic_env):
+    """Elapsed window slots drop at the next flush instead of surviving on disk."""
+    from hermes_cli.auth import write_credential_pool
+
+    now = time.time()
+    stale = {
+        "m-dead": {"reset_at": now - 60, "consecutive_count": 2},
+        "m-live": {"reset_at": now + 300, "consecutive_count": 1},
+    }
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(model_cooldowns=dict(stale))],
+    }))
+
+    write_credential_pool("openrouter", [_pool_entry(model_cooldowns=dict(stale))])
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    persisted = data["credential_pool"]["openrouter"][0]
+    windows = persisted.get("model_cooldowns") or {}
+    assert "m-dead" not in windows
+    assert windows["m-live"]["reset_at"] == now + 300
+    assert windows["m-live"]["consecutive_count"] == 1
+
+
+def test_root_pool_update_reaps_expired_model_windows(classic_env):
+    """The root-store UPDATE path shares the merge core, so it reaps as well."""
+    from agent.credential_pool import _update_root_pool_rows
+
+    now = time.time()
+    root_path = classic_env / "auth.json"
+    stale = {"m-dead": {"reset_at": now - 60, "consecutive_count": 1}}
+    _write(root_path, _make_auth_store(pool={
+        "openrouter": [_pool_entry(model_cooldowns=dict(stale))],
+    }))
+
+    _update_root_pool_rows("openrouter", [_pool_entry(model_cooldowns=dict(stale))], root_path)
+
+    data = json.loads(root_path.read_text())
+    persisted = data["credential_pool"]["openrouter"][0]
+    assert not (persisted.get("model_cooldowns") or {})
