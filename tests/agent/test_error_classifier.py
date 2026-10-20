@@ -394,6 +394,49 @@ class TestClassifyApiError:
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("provider", ["modelscope", "custom:modelscope", "MODELSCOPE"])
+    def test_429_modelscope_insufficient_quota_is_rate_limit(self, provider):
+        # ModelScope's rate-limit 429 carries OpenAI's billing-worded
+        # ``insufficient_quota`` body: it must stay a retryable rate limit, never
+        # abort the conversation as billing. (real body from errors.log:
+        # code=insufficient_quota, help.aliyun.com/zh/model-studio/error-code#token-limit)
+        e = MockAPIError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            status_code=429,
+            body={"error": {"code": "insufficient_quota", "type": "insufficient_quota",
+                            "message": "You exceeded your current quota."}},
+        )
+        result = classify_api_error(e, provider=provider, model="deepseek-ai/DeepSeek-V4-Flash-0731")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.retryable is True
+
+    def test_429_openai_insufficient_quota_stays_billing(self):
+        # Guard: the billing-worded list is provider-scoped — for OpenAI the same
+        # ``insufficient_quota`` code IS credit exhaustion.
+        e = MockAPIError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            status_code=429,
+            body={"error": {"code": "insufficient_quota", "type": "insufficient_quota",
+                            "message": "You exceeded your current quota."}},
+        )
+        result = classify_api_error(e, provider="openai", model="gpt-5")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
+    def test_429_unlisted_provider_insufficient_quota_stays_billing(self):
+        # The billing-worded carve-out keys on the vendor list itself, not on
+        # "anything except OpenAI": an unlisted slug keeps the billing verdict.
+        e = MockAPIError(
+            "You exceeded your current quota, please check your plan and billing details.",
+            status_code=429,
+            body={"error": {"code": "insufficient_quota", "message": "quota exceeded"}},
+        )
+        result = classify_api_error(e, provider="custom:acme", model="acme-1")
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+
     def test_429_rate_limit_phrase_never_promotes_to_billing(self):
         # The exclusion guard: "Rate limit exceeded" contains the
         # "limit exceeded" usage-limit substring, but an explicit rate-limit

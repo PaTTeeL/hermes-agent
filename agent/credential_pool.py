@@ -2763,6 +2763,23 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             return None
         return next_entry
 
+    def rate_limit_window_state(self, model_id: str) -> Optional[Tuple[float, int]]:
+        """Earliest per-model 429 window as ``(reset_at, consecutive_count)``.
+
+        ``reset_at`` is a ``time.time()`` (wall-clock) epoch from the stored window;
+        the count is the ladder length that sized it (consecutive 429s on the model,
+        cleared by a success). None when no entry is rate-limited for *model_id*.
+        """
+        now = time.time()
+        best: Optional[Tuple[float, int]] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                row = (entry.model_cooldowns or {}).get(model_id)
+                if best is None or ts < best[0]:
+                    best = (ts, int(row.consecutive_count or 0) if row is not None else 0)
+        return best
+
     def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
         """Return the earliest per-model rate-limit TTL across all entries.
 
@@ -2770,13 +2787,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         rate-limited for *model_id*. Callers that need a wait duration subtract
         ``time.time()``.
         """
-        now = time.time()
-        min_ttl: Optional[float] = None
-        for entry in self._entries:
-            ts = _model_rate_limited_until(entry, model_id)
-            if ts is not None and ts > now:
-                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
-        return min_ttl
+        state = self.rate_limit_window_state(model_id)
+        return state[0] if state is not None else None
 
     def mark_rate_limited(
         self,

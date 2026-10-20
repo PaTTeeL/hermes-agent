@@ -7,6 +7,7 @@ the user is told to run.
 """
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -147,6 +148,19 @@ def test_exhausted_plan_quota_429_names_the_reset_window_not_wait_a_minute():
         base_url="https://openrouter.ai/api/v1", model="m",
     )
     assert "Wait a minute" in plain["final_response"] and "resets in" not in plain["final_response"]
+
+
+def test_terminal_rate_limit_lands_in_the_log(caplog):
+    """A terminal rate-limit turn is traceable from the log alone, not only the UI status line."""
+    error = _Http(429, "HTTP 429: Rate limit exceeded")
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
+        max_retries_exhausted_result(
+            _Agent(), error, classify_api_error(error, provider="openrouter", model="m"), max_retries=3,
+            is_rate_limited=True, error_msg=str(error).lower(), api_kwargs=None, api_messages=[], messages=[],
+            conversation_history=None, api_call_count=3, approx_tokens=10, provider="openrouter",
+            base_url="https://openrouter.ai/api/v1", model="m",
+        )
+    assert "Rate limited after 3 retries — HTTP 429: Rate limit exceeded" in caplog.text
 
 
 def test_invalid_response_stamps_reason_from_embedded_provider_code():

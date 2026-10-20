@@ -204,6 +204,7 @@ class TestTerminalResultsCarryTheFreeTierBlock:
         agent = _agent(_dump_api_request_debug=lambda *a, **k: None, _flush_status_buffer=lambda: None,
                        _summarize_api_error=lambda e: "HTTP 403: no permissions", _emit_status=lambda *a: None,
                        _persist_session=lambda *a: None, _plines=lambda *a: None, _buffer_status=lambda *a: None,
+                       _client_log_context=lambda: "nous/welcome",
                        _rate_limit_state=None, _has_pending_fallback=lambda: False)
         from agent.status_output import StatusOutputMixin
         agent._emit_diagnostic_status = StatusOutputMixin._emit_diagnostic_status.__get__(agent)

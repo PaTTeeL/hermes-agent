@@ -1221,30 +1221,33 @@ def _interruptible_sleep(agent, seconds: float, *, status_msg: Optional[str] = N
             return False
         if status_msg and remaining > 1.0:
             try:
-                agent._emit_status(f"{status_msg} (~{remaining:.0f}s left)...")
+                agent._emit_status(f"{status_msg} ({_fmt_wait_span(remaining)} left)...")
             except Exception:
                 pass
         time.sleep(min(0.2, remaining))
 
 
-def _chain_rate_limit_ttls(agent) -> tuple:
-    """Return (primary_ttl, first_fallback_ttl, fallback_min_ttl) for the 429 wait decision.
+def _chain_rate_limit_windows(agent) -> tuple:
+    """Return (primary_window, fallback_windows) for the 429 wait decision.
 
-    Each value is a wall-clock reset timestamp (``time.time()``) for the earliest
-    per-model rate limit on that backend's credential pool, or None when that backend
-    carries no rate-limit record (its failure had another cause). The three values are
-    what ``_do_chain_exhausted_sleep`` turns into one sleep per strategy.
+    Each window is ``(label, reset_at, consecutive_count)``: the model's label, its
+    earliest per-model rate-limit reset (wall-clock ``time.time()``), and the ladder
+    length sized by its consecutive 429s. The primary reads the bound credential
+    pool; fallback windows follow ``_fallback_chain`` order, one per backend that
+    carries a live record. A backend without a record contributes nothing (its
+    failure had another cause).
     """
-    primary_ttl: Optional[float] = None
+    primary_window: Optional[tuple] = None
     pool = getattr(agent, "_credential_pool", None)
     if pool is not None:
         model = getattr(agent, "model", "") or ""
         try:
-            primary_ttl = pool.rate_limit_min_ttl(model)
+            state = pool.rate_limit_window_state(model)
         except Exception:
-            primary_ttl = None
-    fallback_ttls: List[float] = []
-    first_ttl: Optional[float] = None
+            state = None
+        if state is not None:
+            primary_window = (model or "the current model", state[0], state[1])
+    fallback_windows: List[tuple] = []
     for fb in (getattr(agent, "_fallback_chain", None) or []):
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
@@ -1258,16 +1261,23 @@ def _chain_rate_limit_ttls(agent) -> tuple:
         if fb_pool is None or not fb_pool.has_credentials():
             continue
         try:
-            ttl = fb_pool.rate_limit_min_ttl(fb_model)
+            state = fb_pool.rate_limit_window_state(fb_model)
         except Exception:
-            ttl = None
-        if ttl is None:
+            state = None
+        if state is None:
             continue
-        if first_ttl is None:
-            first_ttl = ttl
-        fallback_ttls.append(ttl)
-    fallback_min_ttl = min(fallback_ttls) if fallback_ttls else None
-    return primary_ttl, first_ttl, fallback_min_ttl
+        fallback_windows.append((fb_model, state[0], state[1]))
+    return primary_window, fallback_windows
+
+
+def _fmt_wait_span(secs: float) -> str:
+    """``42 -> "42s"``, ``95 -> "1m35s"``, ``3725 -> "1h02m"`` — a precise wait span."""
+    total = int(max(0.0, secs))
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m{total % 60:02d}s"
+    return f"{total // 3600}h{(total % 3600) // 60:02d}m"
 
 
 def _do_chain_exhausted_sleep(agent) -> bool:
@@ -1281,9 +1291,15 @@ def _do_chain_exhausted_sleep(agent) -> bool:
     ``primary_else_fastest`` / ``fastest_recovery`` / ``current_only``); when no backend
     carries a rate-limit record there is no unlock event to wait for, so this returns False
     and the caller keeps its terminal handling.
+
+    The wait notice names the target model once — the window's local reopen clock, the
+    precise remaining span, and the model's consecutive-429 count (the congestion
+    read-out) — and is emitted as the sleep starts, on the durable status line and the
+    live wait line. The ticking line carries the precise remaining span.
     """
-    primary_ttl, first_ttl, fallback_min_ttl = _chain_rate_limit_ttls(agent)
-    if primary_ttl is None and first_ttl is None and fallback_min_ttl is None:
+    primary_window, fallback_windows = _chain_rate_limit_windows(agent)
+    if primary_window is None and not fallback_windows:
+        logger.warning("429 chain exhausted — no wait: no rate-limit window on any backend")
         return False
     try:
         from agent.credential_pool import get_self_healing_strategy
@@ -1291,26 +1307,35 @@ def _do_chain_exhausted_sleep(agent) -> bool:
     except Exception:
         strategy = "strict_sequential"
     if strategy == "current_only":
-        sleep_until = primary_ttl
+        target = primary_window
     elif strategy == "fastest_recovery":
-        candidates = [t for t in (primary_ttl, fallback_min_ttl) if t is not None]
-        sleep_until = min(candidates) if candidates else None
+        candidates = [w for w in (primary_window, *fallback_windows) if w is not None]
+        target = min(candidates, key=lambda w: w[1]) if candidates else None
     elif strategy == "primary_else_fastest":
-        sleep_until = primary_ttl if primary_ttl is not None else fallback_min_ttl
+        target = primary_window or (min(fallback_windows, key=lambda w: w[1]) if fallback_windows else None)
     else:
-        sleep_until = primary_ttl if primary_ttl is not None else first_ttl
+        target = primary_window or (fallback_windows[0] if fallback_windows else None)
+    if target is None:
+        logger.warning("429 chain exhausted — no wait: no eligible window for strategy=%s", strategy)
+        return False
+    label, sleep_until, consecutive = target
     now = time.time()
-    if sleep_until is None or sleep_until <= now:
+    if sleep_until <= now:
+        logger.warning("429 chain exhausted — no wait: window already elapsed")
         return False
     wait = sleep_until - now
     logger.info(
-        "All backends rate-limited — waiting %.0fs for a 429 window (strategy=%s)",
-        wait, strategy,
+        "All backends rate-limited — waiting %.0fs for a 429 window (strategy=%s, model=%s, consecutive=%d)",
+        wait, strategy, label, consecutive,
     )
-    agent._buffer_diagnostic_status(
-        f"⏳ All backends rate-limited — waiting {wait:.0f}s for a 429 window to reopen..."
+    notice = (
+        f"⏳ All backends rate-limited — {label}: window reopens in {_fmt_wait_span(wait)}"
+        f" (at {time.strftime('%H:%M:%S', time.localtime(sleep_until))}),"
+        f" consecutive 429s: {consecutive}"
     )
-    return _interruptible_sleep(agent, wait, status_msg="⏳ Waiting for rate limit")
+    agent._emit_diagnostic_status(notice)
+    agent._emit_diagnostic_wait(notice)
+    return _interruptible_sleep(agent, wait, status_msg=f"⏳ Waiting for rate limit — {label}")
 
 
 def _peel_moa_guidance(messages: List[Dict[str, Any]], guidance: Any) -> List[Dict[str, Any]]:

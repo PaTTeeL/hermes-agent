@@ -508,9 +508,33 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { text: streamed }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getTurnState().reasoning).toBe(streamed)
+      expect(getTurnState().reasoning).toBe(`${streamed}\n`)
       expect(getTurnState().reasoningActive).toBe(true)
-      expect(getTurnState().reasoningTokens).toBe(estimateTokensRough(streamed))
+      expect(getTurnState().reasoningTokens).toBe(estimateTokensRough(`${streamed}\n`))
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('terminates each thinking.delta notice so consecutive notices stay countable', () => {
+    vi.useFakeTimers()
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    const first =
+      '⏳ waiting on test-model — 60s waiting for the first stream chunk (auto-reconnect: stream stale watchdog in 540s)'
+
+    const second =
+      '⏳ still waiting on test-model — 585s waiting for the first stream chunk (auto-reconnect: stream stale watchdog in 15s)'
+
+    try {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: first }, type: 'thinking.delta' } as any)
+      onEvent({ payload: { text: second }, type: 'thinking.delta' } as any)
+      vi.runOnlyPendingTimers()
+
+      expect(getTurnState().reasoning).toBe(`${first}\n${second}\n`)
+      expect(getTurnState().reasoning.split('\n').filter(Boolean)).toHaveLength(2)
     } finally {
       vi.useRealTimers()
     }

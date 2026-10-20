@@ -171,6 +171,11 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = (
     "wait", "requests remaining", "periodic", "window", "per minute", "per second",
 )
 
+# Vendors that word a rate-limit 429 with OpenAI's billing-shaped ``insufficient_quota``
+# body: wait the window out instead of reading the wording as credit exhaustion.
+# Provider-scoped on purpose: for OpenAI the same code IS credit exhaustion.
+_RATE_LIMITS_WORDED_AS_BILLING = ("modelscope",)
+
 # 413 detected from message text (proxies embed the status or re-wrap
 # Anthropic's "request_too_large" type without one).
 _PAYLOAD_TOO_LARGE_PATTERNS = (
@@ -1047,6 +1052,10 @@ def _status_429(c: _Ctx) -> Verdict:
     # ``terminal_quota_exhausted`` (a hard cap, not throttling) on 429s, and
     # this handler always returns, so _by_error_code never sees the code.
     if c.code in _BILLING_ERROR_CODES:
+        # A listed vendor's ``insufficient_quota`` words a rate limit as billing
+        # (see ``_RATE_LIMITS_WORDED_AS_BILLING``): wait out the window instead.
+        if c.code == "insufficient_quota" and any(v in c.provider_slug for v in _RATE_LIMITS_WORDED_AS_BILLING):
+            return _V_RATE_LIMIT
         return _V_BILLING
     # Z.AI/Zhipu reuse 429 for server-wide overload: back off on the same
     # key instead of burning the pool (#14038).
