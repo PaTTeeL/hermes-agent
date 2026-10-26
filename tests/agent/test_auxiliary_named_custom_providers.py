@@ -154,6 +154,61 @@ class TestResolveProviderClientNamedCustom:
         assert "api.b.ai" in str(client.base_url)
         assert client.api_key == "sk-real-b-ai-pool-key-12345"
 
+    def test_pool_key_wins_over_inline_for_named_custom(self, tmp_path):
+        """The credential pool governs: with both present, the pool's selected key is used."""
+        _write_config(tmp_path, {
+            "providers": {
+                "b-ai": {
+                    "name": "B.AI",
+                    "base_url": "https://api.b.ai/v1",
+                    "api_key": "inline-stale-key",
+                },
+            },
+        })
+        auth_path = tmp_path / ".hermes" / "auth.json"
+        auth_path.write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "b-ai": [
+                    {
+                        "id": "k1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "pool-token-aaa",
+                    }
+                ]
+            },
+        }))
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client("b-ai", "b-ai-model")
+        assert client is not None
+        assert client.api_key == "pool-token-aaa"
+
+    def test_inline_key_used_when_pool_has_no_credentials(self, tmp_path):
+        """Pool-first falls through: an empty pool leaves the inline key in charge."""
+        _write_config(tmp_path, {
+            "providers": {
+                "b-ai": {
+                    "name": "B.AI",
+                    "base_url": "https://api.b.ai/v1",
+                    "api_key": "inline-key-bbb",
+                },
+            },
+        })
+        auth_path = tmp_path / ".hermes" / "auth.json"
+        auth_path.write_text(json.dumps({
+            "version": 1,
+            "providers": {},
+            "credential_pool": {"b-ai": []},
+        }))
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client("b-ai", "b-ai-model")
+        assert client is not None
+        assert client.api_key == "inline-key-bbb"
+
 
 class TestResolveProviderClientModelNormalization:
     """Direct-provider auxiliary routing should normalize models like main runtime."""
