@@ -167,8 +167,48 @@ def _platform_names(mapping: Any) -> set[str]:
     return {getattr(platform, "value", str(platform)).lower() for platform in mapping}
 
 
+# Platform labels that all name a local CLI/TUI session: the canonical ``local`` plus the
+# legacy ``cli``/``tui`` labels older subscribers stored. They share one delivery path.
+_LOCAL_PLATFORM_LABELS = frozenset({"local", "cli", "tui"})
+
+
+def _is_local_platform(platform: Any) -> bool:
+    """True for a local CLI/TUI session's platform label (canonical or legacy)."""
+    return getattr(platform, "value", str(platform)).lower() in _LOCAL_PLATFORM_LABELS
+
+
+def _local_chat_id(chat_id: Any) -> str:
+    """The bare session id of a local subscription: a routing key
+    (``agent:<profile>:local:dm:<id>``) is not a chat id — re-keying it doubles the key and
+    the parse truncates to a phantom chat, so the wake can never match a live session.
+    Session ids never contain colons, so the last segment is the id."""
+    value = str(chat_id or "")
+    return value.rsplit(":", 1)[-1] if ":" in value else value
+
+
+def _local_authority(runner: Any, owner_profile: Optional[str]) -> Any:
+    """The session authority a local wake rides: the served profile's when the subscription
+    names one, else the active (launch) authority."""
+    registry = getattr(runner, "session_authorities", None)
+    if registry is not None and owner_profile:
+        for authority in registry:
+            if registry.profile_name(authority) == owner_profile:
+                return authority
+    from gateway.session_authorities import active_authority
+    return active_authority(runner)
+
+
 def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
     """Resolve a durable route without turning a missing secondary bot into primary authority."""
+    if _is_local_platform(platform):
+        # Local CLI/TUI sessions deliver through the ONE cached LocalSessionAdapter the
+        # authority's local path already uses (gateway/session_local_recovery.py), never a
+        # throwaway instance: a per-wake construction ships without the runner's message
+        # handler, so the fallback self-post lands in the handler-less drop.
+        authority = _local_authority(runner, owner_profile)
+        if authority is not None:
+            from gateway.session_local_recovery import local_adapter
+            return local_adapter(authority)
     adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
     if not getattr(config, "multiplex_profiles", False):
@@ -267,6 +307,11 @@ class _Collector:
         # and again at delivery, rewinding if the route or adapter changed.
         self.active_platforms = _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+        # Local CLI/TUI sessions are valid notification targets: they use the
+        # FIFO wake self-post path (not a network adapter), so always admit
+        # them past this coarse pre-filter. Without this, every local-sub
+        # delivery is silently dropped at the _claim_for_sub platform gate.
+        self.active_platforms.update(_LOCAL_PLATFORM_LABELS)
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
@@ -327,7 +372,10 @@ class _Collector:
                          sub.get("task_id"), platform or "<missing>")
             return None
         from gateway.config import Platform
-        if _adapter_for_subscription(self.runner, Platform(platform), sub, owner_profile or self.notifier_profile) is None:
+        # Local-family labels all resolve through Platform.LOCAL; the stored row keeps its
+        # original label for the cursor ops below.
+        effective_platform = "local" if platform in _LOCAL_PLATFORM_LABELS else platform
+        if _adapter_for_subscription(self.runner, Platform(effective_platform), sub, owner_profile or self.notifier_profile) is None:
             _warn_anchorless_thread_sub_once(sub, platform)
             return None
         old_cursor, cursor, events = _kbn().claim_unseen_events_for_sub(
@@ -515,15 +563,26 @@ class _KanbanNotification:
     is at-least-once queueing, not an execution or final-response receipt.
     """
 
-    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict) -> None:
+    def __init__(self, runner: Any, d: dict, *, platform_cls: Any, sub_fail_counts: dict,
+                 wake_refusal_counts: Optional[dict] = None) -> None:
         self.runner = runner
         self.d = d
         self.platform_cls = platform_cls
         self.sub_fail_counts = sub_fail_counts
+        runner_refusal_counts = getattr(runner, "_kanban_wake_refusal_counts", None)
+        self.wake_refusal_counts = (wake_refusal_counts if wake_refusal_counts is not None
+                                    else runner_refusal_counts if runner_refusal_counts is not None else {})
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
         self.platform_str = (sub["platform"] or "").lower()
+        if self.platform_str in _LOCAL_PLATFORM_LABELS:
+            # Legacy local labels deliver through the canonical LOCAL path; the stored
+            # row keeps its own label for the cursor ops.
+            self.platform_str = "local"
+        # A local subscription's chat id is the bare session id; a stored routing key is
+        # unwrapped so the wake keys the real session.
+        self.chat_id = _local_chat_id(sub["chat_id"]) if self.platform_str == "local" else sub["chat_id"]
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
         self.title = (task.title if task else sub["task_id"])[:120]
@@ -559,6 +618,7 @@ class _KanbanNotification:
 
     def clear_failures(self) -> None:
         self.sub_fail_counts.pop(self.sub_key, None)
+        self.wake_refusal_counts.pop(self.sub_key, None)
 
     async def delivery_failed(self, fmt: str, prefix: tuple, drop_fmt: str, exc: Exception, exc_info: bool) -> None:
         """Bump the failure counter; drop the sub past the limit, else rewind the claim so the next tick retries."""
@@ -600,10 +660,10 @@ class _KanbanNotification:
         if self.is_push_adapter:
             self.session_key = getattr(task, "session_id", None) or ""
         else:
-            # Non-push wakes target sub["chat_id"] (the raw session id the
+            # Non-push wakes target the subscription's chat id (the raw session id the
             # subscriber registered). task.session_id may be a WORKER session
             # for child tasks; use it only for legacy rows.
-            self.session_key = sub["chat_id"] or getattr(task, "session_id", None) or ""
+            self.session_key = self.chat_id or getattr(task, "session_id", None) or ""
         # i18n keys: gateway.kanban.wake.<kind> for each _WAKE_KINDS entry.
         _parts = [t(f"gateway.kanban.wake.{k}") for k in _WAKE_KINDS if k in self.wake_kinds]
         _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
@@ -622,7 +682,7 @@ class _KanbanNotification:
 
     def _log_woke(self) -> None:
         logger.info("kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                    self.task_id, self.platform_str, self.sub["chat_id"], self.sub_profile or "default", self.wake_kinds)
+                    self.task_id, self.platform_str, self.chat_id, self.sub_profile or "default", self.wake_kinds)
 
     def _served_wake_profile(self) -> Optional[str]:
         """The subscription's profile when THIS gateway is a multiplexer serving it, else ``None``.
@@ -644,7 +704,7 @@ class _KanbanNotification:
             return contextlib.nullcontext()
         from gateway.run import _async_profile_runtime_scope
         from gateway.session import SessionSource
-        source = SessionSource(platform=self.plat, chat_id=self.sub["chat_id"], profile=served_profile)
+        source = SessionSource(platform=self.plat, chat_id=self.chat_id, profile=served_profile)
         return _async_profile_runtime_scope(runner._resolve_profile_home_for_source(source))
 
     async def wake(self) -> None:
@@ -675,7 +735,7 @@ class _KanbanNotification:
         _delivery_meta = sub.get("delivery_metadata") or {}
         _chat_type = str(sub.get("chat_type") or _delivery_meta.get("chat_type") or "").strip()
         _source = SessionSource(
-            platform=self.plat, chat_id=sub["chat_id"], chat_type=_chat_type or "group",
+            platform=self.plat, chat_id=self.chat_id, chat_type=_chat_type or "group",
             thread_id=sub.get("thread_id") or None, user_id=sub.get("user_id"), user_id_alt=sub.get("user_id_alt"),
             profile=self.sub_profile or None, scope_id=_wake_scope_id(self.adapter, sub),
             parent_chat_id=_delivery_meta.get("parent_chat_id"),
@@ -703,7 +763,7 @@ class _KanbanNotification:
         _send_res = None
         async def send_ping():
             nonlocal _send_res
-            _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
+            _send_res = await adapter.send(self.chat_id, msg, metadata=metadata)
         if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
             return False
         # SendResult(success=False) without an exception is a FAILED delivery
@@ -712,7 +772,7 @@ class _KanbanNotification:
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                     ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
+                     ev.kind, self.task_id, self.platform_str, self.chat_id, self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
         # native files. Both handoff kinds stage files for exactly this: a
         # review-bound card's files exist precisely so the human sees them at
@@ -721,7 +781,7 @@ class _KanbanNotification:
         if ev.kind in ("completed", "review_requested"):
             try:
                 await self.runner._deliver_kanban_artifacts(
-                    adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
+                    adapter=adapter, chat_id=self.chat_id, metadata=metadata,
                     event_payload=getattr(ev, "payload", None), task=self.task,
                 )
             except Exception as art_exc:
@@ -834,9 +894,20 @@ class _KanbanNotification:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
                 self.clear_failures()
-            except WakeNotAccepted:
+            except WakeNotAccepted as _wk_refusal:
                 # Startup / full queue is not a dead destination. Keep the durable
-                # subscription alive regardless of how long admission takes.
+                # subscription alive regardless of how long admission takes — and say
+                # so with the refusal reason and the consecutive-refusal count: a
+                # silently rewinding wake reads as a healthy pipeline while the
+                # target never receives anything.
+                refusals = self.wake_refusal_counts.get(self.sub_key, 0) + 1
+                self.wake_refusal_counts[self.sub_key] = refusals
+                logger.warning(
+                    "kanban notifier: wake not accepted for %s/%s (reason=%s, refusal #%d) — rewound for retry",
+                    self.task_id, self.platform_str,
+                    getattr(_wk_refusal, "reason", None) or "unspecified",
+                    refusals,
+                )
                 await self.rewind()
                 return
             except Exception as _wk_err:

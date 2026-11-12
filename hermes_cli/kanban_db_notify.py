@@ -25,6 +25,11 @@ if TYPE_CHECKING:
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
 
+# Platform labels that all name a local CLI/TUI session: the canonical "local" plus the
+# legacy "cli"/"tui" labels older subscribers stored; the gateway side mirrors this set
+# in gateway/kanban_watchers_notifier._LOCAL_PLATFORM_LABELS.
+_LOCAL_PLATFORM_LABELS = frozenset({"local", "cli", "tui"})
+
 _SCALAR_TYPES = (str, int, float, bool)
 
 # Subscription primary key predicate; every per-row statement below binds
@@ -96,6 +101,12 @@ def add_notify_sub(
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
+    if platform in _LOCAL_PLATFORM_LABELS and ":" in (chat_id or ""):
+        # A routing key ("agent:<profile>:local:dm:<id>") is not a chat id: the delivery
+        # path re-keys it into a doubled session key whose parse truncates to a phantom
+        # chat ("agent"), so the wake can never match a live session. Store the bare
+        # session id (the last segment); session ids never contain colons.
+        chat_id = chat_id.rsplit(":", 1)[-1]
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
         existing = conn.execute(
