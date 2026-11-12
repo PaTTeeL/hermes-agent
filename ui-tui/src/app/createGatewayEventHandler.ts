@@ -1278,7 +1278,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           scheduleThinkingStatus(value || statusFromBusy())
 
           if (value) {
-            turnController.recordReasoningDelta(value)
+            // Standalone status notices (wait lines, spinner text), not stream
+            // fragments: terminate each so consecutive notices stay countable.
+            turnController.recordReasoningDelta(`${value}\n`)
           }
         }
 

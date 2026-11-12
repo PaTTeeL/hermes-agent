@@ -48,7 +48,7 @@ class StreamingWaitMonitor:
         if self._note_attempt_kill(elapsed, "stale"):
             return
         if self._claims_liveness():  # the reconnect notice touches activity too (_emit_wait_notice)
-            self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
+            self.agent._emit_diagnostic_wait(f"⚠  no output from provider for {int(elapsed)}s — reconnecting...")
             self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
     def _note_attempt_kill(self, elapsed: float, kind: str) -> bool:

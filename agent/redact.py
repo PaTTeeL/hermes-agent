@@ -536,6 +536,8 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
 # ``privateKey``, ``signing_key``) and kubeconfig's ``client-key-data`` (a base64 PEM).
 # The bare word ``key`` stays out: it names cache keys and model limits. A qualifier
 # word has to sit in front of it, which is what the alternation spells out.
+# Header-shaped names (authorization / proxy-authorization / set-cookie / x-api-key) cover
+# credentials a provider echoes back in response headers.
 _KEY_QUALIFIED_NAME = (
     r"[\w.\-]*(?:secret|private|signing|encryption|encrypt|master|hmac|symmetric|access)"
     r"[_.\-]?(?:key|Key|KEY)"
@@ -543,7 +545,8 @@ _KEY_QUALIFIED_NAME = (
 _JSON_KEY_NAMES = (
     r"(?:api_?[Kk]ey|token|secret|password|pgpassword|mysql_pwd|sshpass|access_token|refresh_token|auth_token|bearer"
     r"|secret_value|raw_secret|secret_input|key_material|client[_.\-]?key[_.\-]?data"
-    rf"|{_KEY_QUALIFIED_NAME})"
+    rf"|{_KEY_QUALIFIED_NAME}"
+    r"|authorization|proxy-authorization|set-cookie|x-api-key)"
 )
 _JSON_FIELD_RE = re.compile(rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"', re.IGNORECASE)
 # The same field inside a JSON-encoded string (``{"output": "{\\"api_key\\": \\"…\\"}"}``): every tool result
