@@ -161,6 +161,18 @@ def _platform_names(mapping: Any) -> set[str]:
 
 def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profile: Optional[str]) -> Any:
     """Resolve a durable route without turning a missing secondary bot into primary authority."""
+    # Local CLI/TUI sessions use LocalSessionAdapter (gateway/session_local.py),
+    # which the 2026-10-25 fix (65cac9a4c8) equipped with gateway_runner for
+    # admit_route_wake. Return a proper LocalSessionAdapter bound to the
+    # runner's session authority so the push wake path works end-to-end.
+    if getattr(platform, 'value', str(platform)).lower() == 'local':
+        from gateway.session_local import LocalSessionAdapter
+        authority = getattr(runner, 'session_authority', None)
+        if authority is not None:
+            return LocalSessionAdapter(authority)
+        registry = getattr(runner, 'session_authorities', None)
+        if registry:
+            return LocalSessionAdapter(registry[0])
     adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
     if not getattr(config, "multiplex_profiles", False):
@@ -248,6 +260,11 @@ class _Collector:
         # and again at delivery, rewinding if the route or adapter changed.
         self.active_platforms = _platform_names(runner.adapters).union(
             *(_platform_names(m) for m in self.profile_adapters.values()))
+        # Local CLI/TUI sessions are valid notification targets: they use the
+        # FIFO wake self-post path (not a network adapter), so always admit
+        # them past this coarse pre-filter. Without this, every local-sub
+        # delivery is silently dropped at the _claim_for_sub platform gate.
+        self.active_platforms.add("local")
 
     def collect(self) -> list[dict]:
         if not self.active_platforms:
