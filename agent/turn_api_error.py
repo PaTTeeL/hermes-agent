@@ -355,6 +355,9 @@ def settle_unrecovered_error(
             if agent._has_pending_fallback():
                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
+                # The terminal dump fires only at chain exhaustion — capture the absorbed request here.
+                from agent.turn_recovery import _dump_request_for_fallback_absorbed_error
+                _dump_request_for_fallback_absorbed_error(agent, api_kwargs, api_error, classified)
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
@@ -394,6 +397,9 @@ def settle_unrecovered_error(
             return _verdict("continue")
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+            # Same capture for the retryable ladder: the exhausted request's wire evidence lands here.
+            from agent.turn_recovery import _dump_request_for_fallback_absorbed_error
+            _dump_request_for_fallback_absorbed_error(agent, api_kwargs, api_error, classified)
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
         if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler

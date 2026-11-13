@@ -1,0 +1,128 @@
+# commit A: dump the wire request of the first error a fallback absorbs
+# Covers both absorption seams: non-retryable client errors (agent/turn_api_error.py
+# non-retryable branch) and the retryable ladder exhausting max_retries (429/transport).
+# Dedupe: one dump per (session, provider, model, classified reason) per process.
+# Apply: git apply dump-first-nonretryable.patch
+# Test:  scripts/run_tests.sh tests/agent/test_nonretryable_fallback_dump.py
+
+--- a/agent/turn_recovery.py
++++ b/agent/turn_recovery.py
+@@ -1027,6 +1027,34 @@
+         return suggest_prefixed_model_id(str(provider or ""), str(model or ""))
+     except Exception:
+         return None
++
++
++_FALLBACK_ABSORBED_DUMP_KEYS: set[tuple] = set()
++
++
++def _dump_request_for_fallback_absorbed_error(agent, api_kwargs, api_error, classified) -> None:
++    """Capture the wire request of an error a fallback is about to absorb.
++
++    dump_api_request_debug fires only on the terminal path (fallback chain exhausted), so a
++    provider error that a fallback papers over leaves no wire evidence for diagnosis. One
++    dump per (session, provider, model, classified reason) per process keeps a repeat storm
++    cheap.
++    """
++    reason_value = str(getattr(classified.reason, "value", getattr(classified, "reason", "")))
++    key = (getattr(agent, "session_id", ""), getattr(agent, "provider", ""),
++           getattr(agent, "model", ""), reason_value)
++    if key in _FALLBACK_ABSORBED_DUMP_KEYS:
++        return
++    if len(_FALLBACK_ABSORBED_DUMP_KEYS) > 256:
++        _FALLBACK_ABSORBED_DUMP_KEYS.clear()
++    _FALLBACK_ABSORBED_DUMP_KEYS.add(key)
++    try:
++        dump_path = agent._dump_api_request_debug(
++            api_kwargs, reason=f"fallback_absorbed:{reason_value}", error=api_error)
++        if dump_path:
++            _ra().logger.info("%sDumped fallback-absorbed request to %s", agent.log_prefix, dump_path)
++    except Exception:
++        _ra().logger.debug("Fallback-absorbed request dump failed", exc_info=True)
+ 
+ 
+ def nonretryable_client_error_result(
+
+--- a/agent/turn_api_error.py
++++ b/agent/turn_api_error.py
+@@ -351,6 +351,9 @@
+             if agent._has_pending_fallback():
+                 _label = _NONRETRYABLE_LABELS.get(classified.reason, f"Non-retryable error (HTTP {status_code})")
+                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
++                # The terminal dump fires only at chain exhaustion — capture the absorbed request here.
++                from agent.turn_recovery import _dump_request_for_fallback_absorbed_error
++                _dump_request_for_fallback_absorbed_error(agent, api_kwargs, api_error, classified)
+             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
+@@ -390,6 +393,9 @@
+             return _verdict("continue")
+         if agent._has_pending_fallback():
+             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
++            # Same capture for the retryable ladder: the exhausted request's wire evidence lands here.
++            from agent.turn_recovery import _dump_request_for_fallback_absorbed_error
++            _dump_request_for_fallback_absorbed_error(agent, api_kwargs, api_error, classified)
+         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+         if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
+
+--- /dev/null
++++ b/tests/agent/test_nonretryable_fallback_dump.py
+@@ -0,0 +1,57 @@
++"""The first error a fallback absorbs must leave a wire dump.
++
++dump_api_request_debug fires only on the terminal path (fallback chain exhausted);
++a provider error that a fallback papers over otherwise leaves no wire evidence.
++"""
++
++import types
++
++from agent import turn_recovery
++
++
++class _StubAgent:
++    def __init__(self):
++        self.session_id = "s1"
++        self.provider = "custom"
++        self.model = "m"
++        self.log_prefix = ""
++        self.dumps = []
++
++    def _dump_api_request_debug(self, api_kwargs, *, reason, error):
++        self.dumps.append((reason, error))
++        return "/tmp/dump.json"
++
++
++def _classified(reason="client_error"):
++    return types.SimpleNamespace(reason=reason)
++
++
++def test_dumps_once_per_session_provider_model_reason():
++    agent = _StubAgent()
++    turn_recovery._dump_request_for_fallback_absorbed_error(
++        agent, {"messages": []}, RuntimeError("boom"), _classified())
++    turn_recovery._dump_request_for_fallback_absorbed_error(
++        agent, {"messages": []}, RuntimeError("boom"), _classified())
++    assert len(agent.dumps) == 1
++    assert agent.dumps[0][0] == "fallback_absorbed:client_error"
++
++
++def test_different_reason_dumps_again():
++    agent = _StubAgent()
++    turn_recovery._dump_request_for_fallback_absorbed_error(
++        agent, {}, RuntimeError("x"), _classified("upstream_rate_limit"))
++    turn_recovery._dump_request_for_fallback_absorbed_error(
++        agent, {}, RuntimeError("x"), _classified("client_error"))
++    assert len(agent.dumps) == 2
++    assert agent.dumps[0][0] == "fallback_absorbed:upstream_rate_limit"
++
++
++def test_dump_failure_never_raises():
++    agent = _StubAgent()
++
++    def _boom(*args, **kwargs):
++        raise RuntimeError("disk full")
++
++    agent._dump_api_request_debug = _boom
++    turn_recovery._dump_request_for_fallback_absorbed_error(
++        agent, {}, RuntimeError("x"), _classified())
