@@ -700,10 +700,11 @@ _REASONING_CARRIER_ROUTES: tuple = (
     # Vendors that document reasoning_details replay next to reasoning_content.
     (frozenset({RC, RD}), frozenset({"novita", "tencent-tokenhub", "minimax", "minimax-cn"}),
      ("novita.ai", "tokenhub.tencentmaas.com", "tokenhub-intl.tencentcloudmaas.com", "minimax.io", "minimaxi.com")),
-    # "custom" is deliberately absent: it names a user-supplied endpoint, not a local one. A custom
-    # endpoint on a host no row above names falls through to the is_local_endpoint() fallback, so a
-    # localhost/LAN engine keeps both carriers while a remote gateway gets reasoning_content only --
-    # strict serde gateways alias `reasoning` to `reasoning_content` and reject both keys (#136486).
+    # "custom" (named custom providers) is deliberately absent from this row: they also front
+    # cloud endpoints (custom:nvidia_nim -> integrate.api.nvidia.com) whose strict parsers read a
+    # bare "reasoning" key as an alias of "reasoning_content" and reject a message carrying both
+    # with HTTP 400 "duplicate field". Local stacks keep {RC, R} via the is_local_endpoint()
+    # fallback in route_reasoning_carriers (#136486).
     (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
 )
 
