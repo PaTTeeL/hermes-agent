@@ -689,7 +689,12 @@ _REASONING_CARRIER_ROUTES: tuple = (
     # Vendors that document reasoning_details replay next to reasoning_content.
     (frozenset({RC, RD}), frozenset({"novita", "tencent-tokenhub", "minimax", "minimax-cn"}),
      ("novita.ai", "tokenhub.tencentmaas.com", "tokenhub-intl.tencentcloudmaas.com", "minimax.io", "minimaxi.com")),
-    (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "custom", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
+    # "custom" (named custom providers) is deliberately absent from this row: they also front
+    # cloud endpoints (custom:nvidia_nim -> integrate.api.nvidia.com) whose strict parsers read a
+    # bare "reasoning" key as an alias of "reasoning_content" and reject a message carrying both
+    # with HTTP 400 "duplicate field". Local stacks keep {RC, R} via the is_local_endpoint()
+    # fallback in route_reasoning_carriers.
+    (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
 )
 
 
