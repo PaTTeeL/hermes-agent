@@ -96,6 +96,12 @@ def add_notify_sub(
     # the delivery. A plain 'notify' default would leave those subs with no
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
+    if platform in ("cli", "local") and ":" in (chat_id or ""):
+        # A routing key ("agent:<profile>:local:dm:<id>") is not a chat id: the delivery
+        # path re-keys it into a doubled session key whose parse truncates to a phantom
+        # chat ("agent"), so the wake loops forever on a handler-less adapter. Store the
+        # bare session id (the last segment); session ids never contain colons.
+        chat_id = chat_id.rsplit(":", 1)[-1]
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
         existing = conn.execute(

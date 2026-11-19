@@ -174,13 +174,17 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     # admit_route_wake. Return a proper LocalSessionAdapter bound to the
     # runner's session authority so the push wake path works end-to-end.
     if getattr(platform, 'value', str(platform)).lower() == 'local':
-        from gateway.session_local import LocalSessionAdapter
+        # Local CLI/TUI sessions deliver through the ONE cached LocalSessionAdapter the
+        # authority's local path already uses (gateway/session_local_recovery.py), never a
+        # throwaway instance: a per-wake construction ships without the runner's message
+        # handler, so every fallback self-post lands in the handler-less drop.
         authority = getattr(runner, 'session_authority', None)
+        if authority is None:
+            registry = getattr(runner, 'session_authorities', None)
+            authority = registry[0] if registry else None
         if authority is not None:
-            return LocalSessionAdapter(authority)
-        registry = getattr(runner, 'session_authorities', None)
-        if registry:
-            return LocalSessionAdapter(registry[0])
+            from gateway.session_local_recovery import local_adapter
+            return local_adapter(authority)
     adapter = runner._authorization_adapter(platform, owner_profile)
     config = getattr(runner, "config", None)
     if not getattr(config, "multiplex_profiles", False):
@@ -850,9 +854,16 @@ class _KanbanNotification:
                 for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
                     await self.wake()
                 self.clear_failures()
-            except WakeNotAccepted:
+            except WakeNotAccepted as _wk_refusal:
                 # Startup / full queue is not a dead destination. Keep the durable
-                # subscription alive regardless of how long admission takes.
+                # subscription alive regardless of how long admission takes — but say
+                # so: a silently rewinding wake reads as a healthy pipeline while the
+                # target never receives anything (the 2026-11-18 handler-less drop loop).
+                logger.warning(
+                    "kanban notifier: wake not accepted for %s/%s (reason=%s) — rewound for retry",
+                    self.task_id, self.platform_str,
+                    getattr(_wk_refusal, "reason", None) or "unspecified",
+                )
                 await self.rewind()
                 return
             except Exception as _wk_err:
