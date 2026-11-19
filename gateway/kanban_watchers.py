@@ -89,6 +89,10 @@ class GatewayKanbanWatchersMixin:
 
         sub_fail_counts: dict[tuple, int] = getattr(self, "_kanban_sub_fail_counts", {})
         self._kanban_sub_fail_counts = sub_fail_counts
+        # Consecutive wake-refusal counter per subscription: a refused wake rewinds for
+        # retry, and every retry logs the refusal reason with this count — never silent.
+        wake_refusal_counts: dict[tuple, int] = getattr(self, "_kanban_wake_refusal_counts", {})
+        self._kanban_wake_refusal_counts = wake_refusal_counts
         notifier_profile = getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name()
         self._kanban_notifier_profile = notifier_profile
 
@@ -115,6 +119,7 @@ class GatewayKanbanWatchersMixin:
                 for d in deliveries:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
+                        wake_refusal_counts=wake_refusal_counts,
                     ).deliver()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
