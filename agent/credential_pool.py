@@ -448,15 +448,15 @@ class PooledCredential:
         if self.provider == "nous":
             # Nous stores the runtime inference credential in agent_key for
             # compatibility. It must be a NAS invoke JWT.
-            for token, expires_at, obtained_at in (
-                (self.agent_key, self.agent_key_expires_at, self.agent_key_obtained_at),
-                (self.access_token, self.expires_at, self.obtained_at),
+            for token, expires_at in (
+                (self.agent_key, self.agent_key_expires_at),
+                (self.access_token, self.expires_at),
             ):
                 if (
                     isinstance(token, str)
                     and token.strip()
                     and auth_mod._nous_invoke_jwt_is_usable(
-                        token, scope=getattr(self, "scope", None), expires_at=expires_at, obtained_at=obtained_at,
+                        token, scope=getattr(self, "scope", None), expires_at=expires_at,
                     )
                 ):
                     return token.strip()
@@ -2637,6 +2637,23 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
             return None
         return next_entry
 
+    def rate_limit_window_state(self, model_id: str) -> Optional[tuple[float, int]]:
+        """Earliest per-model 429 window as ``(reset_at, consecutive_count)``.
+
+        ``reset_at`` is a ``time.time()`` (wall-clock) epoch from the stored window;
+        the count is the ladder length that sized it (consecutive 429s on the model,
+        cleared by a success). None when no entry is rate-limited for *model_id*.
+        """
+        now = time.time()
+        best: Optional[tuple[float, int]] = None
+        for entry in self._entries:
+            ts = _model_rate_limited_until(entry, model_id)
+            if ts is not None and ts > now:
+                row = (entry.model_cooldowns or {}).get(model_id)
+                if best is None or ts < best[0]:
+                    best = (ts, int(row.consecutive_count or 0) if row is not None else 0)
+        return best
+
     def rate_limit_min_ttl(self, model_id: str) -> Optional[float]:
         """Return the earliest per-model rate-limit TTL across all entries.
 
@@ -2644,13 +2661,8 @@ class CredentialPool(CredentialPoolSelectionMixin, CredentialPoolAdminMixin, Cre
         rate-limited for *model_id*. Callers that need a wait duration subtract
         ``time.time()``.
         """
-        now = time.time()
-        min_ttl: Optional[float] = None
-        for entry in self._entries:
-            ts = _model_rate_limited_until(entry, model_id)
-            if ts is not None and ts > now:
-                min_ttl = min(min_ttl, ts) if min_ttl is not None else ts
-        return min_ttl
+        state = self.rate_limit_window_state(model_id)
+        return state[0] if state is not None else None
 
     def mark_rate_limited(
         self,
