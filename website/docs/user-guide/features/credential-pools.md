@@ -257,7 +257,11 @@ credential_pool_strategies:
   rate_limit_ttl_first_seconds: 300   # first 429 → 5 min
   rate_limit_ttl_step_seconds: 300    # each consecutive → +5 min
   rate_limit_ttl_max_seconds: 3600    # cap at 1 hour
+  self_healing_strategy: strict_sequential          # current_only | strict_sequential | primary_else_fastest | fastest_recovery
+  rate_limit_wait_threshold_seconds: 600            # windows farther out than this switch to the fallback instead of waiting
 ```
+
+`self_healing_strategy` decides what the post-429 wait targets; `rate_limit_wait_threshold_seconds` separates short windows (wait them out) from long ones (switch to the fallback chain instead).
 
 ## Custom Endpoint Pools
 
